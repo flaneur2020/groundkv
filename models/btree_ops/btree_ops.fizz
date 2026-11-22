@@ -1,0 +1,64 @@
+---
+deadlock_detection: false
+options:
+    crash_on_yield: false
+    max_concurrent_actions: 1
+action_options:
+    "BTree.Put":
+        max_actions: 4
+    "BTree.Delete":
+        max_actions: 2
+---
+
+NOT_FOUND = "NOT_FOUND"
+KEYS = ["a", "b", "c", "d"]
+RANGE_BOUNDS = ["", "a", "b", "c", "d", "e"]
+
+# Ordered B+Tree & range-scan contract specification.
+# With 4 keys ("a".."d") and MaxLeafKeys=2 / MaxBranchKeys=2 in the Go adapter
+# (with freelist ENABLED), Put/Delete sequences exercise multi-level leaf and
+# branch splits, overwrites, leaf deletions, root collapses, empty-tree
+# transitions, and arbitrary half-open [start, end) range scans.
+role BTree:
+    action Init:
+        self.txid = 0
+        self.entries = {}
+
+    atomic action Put:
+        k = oneof KEYS
+        self.txid += 1
+        v = "v" + str(self.txid)
+        self.entries[k] = v
+        return v
+
+    atomic action Delete:
+        k = oneof KEYS
+        self.txid += 1
+        if k in self.entries:
+            self.entries.pop(k)
+        return "OK"
+
+    atomic action Get:
+        k = oneof KEYS
+        return self.entries.get(k, NOT_FOUND)
+
+    atomic action ScanRange:
+        start = oneof RANGE_BOUNDS
+        end = oneof RANGE_BOUNDS
+        parts = []
+        for k in sorted(self.entries.keys()):
+            if start != "" and k < start:
+                continue
+            if end != "" and k >= end:
+                break
+            parts.append(k + "=" + self.entries[k])
+        return ",".join(parts)
+
+action Init:
+    tree = BTree()
+
+always assertion BoundedKeyDomain:
+    for k in tree.entries:
+        if k not in KEYS:
+            return False
+    return True

@@ -67,9 +67,10 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
-echo "==> Running FizzBee MBT suite: ${SUITE_NAME} (${GO_PKG} -run ^${TEST_FUNC}$)"
+echo "==> Running FizzBee MBT suite: ${SUITE_NAME} (${GO_PKG} -run ^${TEST_FUNC}$ ${GO_TEST_FLAGS:-})"
 set +e
-FIZZBEE_MBT_BIN="$MBT_RUNNER" go test -v -count=1 -run "^${TEST_FUNC}$" "$GO_PKG"
+# shellcheck disable=SC2086
+FIZZBEE_MBT_BIN="$MBT_RUNNER" go test ${GO_TEST_FLAGS:-} -v -count=1 -run "^${TEST_FUNC}$" "$GO_PKG"
 RC=$?
 set -e
 

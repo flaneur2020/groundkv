@@ -55,6 +55,26 @@ func (tx *Tx) TxID() uint64 { return tx.meta.TxID }
 // RootPageID returns the B+Tree root page ID visible to this transaction.
 func (tx *Tx) RootPageID() PageID { return tx.meta.Root }
 
+// CommitPhase returns the current durability commit phase of a write transaction:
+// "STAGED", "DATA_WRITTEN", "DATA_SYNCED", "META_WRITTEN", or "IDLE" when closed.
+func (tx *Tx) CommitPhase() string {
+	if tx == nil || tx.closed || !tx.writable {
+		return "IDLE"
+	}
+	switch tx.phase {
+	case txPhaseActive:
+		return "STAGED"
+	case txPhaseDataWritten:
+		return "DATA_WRITTEN"
+	case txPhaseDataSynced:
+		return "DATA_SYNCED"
+	case txPhaseMetaWritten:
+		return "META_WRITTEN"
+	default:
+		return "IDLE"
+	}
+}
+
 // Get retrieves the value for key as seen by this transaction.
 // Returns ErrNotFound if the key does not exist.
 func (tx *Tx) Get(key []byte) ([]byte, error) {

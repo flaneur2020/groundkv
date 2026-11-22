@@ -1,28 +1,26 @@
 # GroundKV
 
-A BoltDB-inspired embedded key-value engine in Go built on an **append-only, copy-on-write (COW) B+Tree**, designed with **FizzBee Model-Based Testing (MBT)** as a first-class citizen.
+A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (COW) B+Tree** with **MVCC reader-aware freelist reclamation**, designed with **FizzBee Model-Based Testing (MBT)** as a first-class citizen.
 
 ## Features
 
-- **Append-only COW B+Tree** (`engine/`): fixed-size CRC32-checksummed pages, leaf/branch splitting, root promotion & collapse, range scans, and structural tree validation (`db.Validate()`).
-- **Dual Meta Pages & Crash Recovery**: alternating meta pages (Page 0 and Page 1) with `Sync`-ordered commit protocol and automatic fallback on torn meta writes.
-- **MVCC Snapshot Isolation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer.
+- **COW B+Tree** (`engine/`): fixed-size CRC32-checksummed pages, leaf/branch splitting, root promotion & collapse, half-open `[start, end)` range scans, and structural tree validation (`db.Validate()`).
+- **Dual Meta Pages & Crash Recovery**: alternating meta pages (Page 0 and Page 1) with 4-phase `Sync`-ordered commits and automatic fallback on torn meta writes.
+- **MVCC Snapshot Isolation & Freelist Reclamation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer; freed pages are persisted as COW freelist chains and recycled strictly when `freeTxID <= min(txid-1, minActiveReaderTxID)`.
 - **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage` (`CrashDropUnsynced`, `CrashReorderedMetaOnly`, `CrashTornMetaWrite`).
 - **First-Class FizzBee Specs & Go MBT Harnesses** (`models/`, `fizztests/`):
-  - `models/kv/kv.fizz` — KV semantics, dual-meta commit protocol, MVCC snapshots, rollback, and crash recovery.
-  - `models/btree/btree.fizz` — Append-only COW B+Tree page immutability, sorted scan order, and historical pinned roots.
-  - `models/durability/durability.fizz` — 4-phase commit durability (`WriteDataPages` → `SyncDataPages` → `WriteMetaPage` → `SyncMetaPage`) under unsynced-drop, reordered-meta-flush, and torn-meta-write power losses.
-  - `models/freelist/freelist.fizz` — MVCC reader-aware freelist & page reclamation (`minActiveReaderTxID` + dual-meta watermark) with on-disk freelist persistence and crash recovery.
+  - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT (`max-parallel-runs: 200`) under Go `-race`**. Zero coupling to storage internals.
+  - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s, volatile vs. durable page/meta buffers, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, and all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`). Every safety assertion is non-tautological and mutation-tested.
+  - `models/btree_ops/btree_ops.fizz` — **Ordered B+Tree & range-scan contract** exercising multi-level splits, deletes, root collapses, empty-tree transitions, and `[start, end)` range scans with freelist enabled.
 
 ## Project Layout
 
 ```text
 groundkv/
-├── models/                        # Formal FizzBee specifications (named models/ to avoid GCC ./specs collision with -race)
-│   ├── kv/kv.fizz                 # KV + Dual-Meta + MVCC + Crash Recovery spec
-│   ├── btree/btree.fizz           # Append-Only COW B+Tree immutability spec
-│   ├── durability/durability.fizz # 4-phase mid-commit power-loss & write-reordering durability spec
-│   └── freelist/freelist.fizz     # MVCC reader-aware freelist & page reclamation spec
+├── models/                                  # Formal FizzBee specifications (named models/ to avoid GCC ./specs collision with -race)
+│   ├── contract/kv_contract.fizz            # Black-box API contract (multi-role + parallel linearizability)
+│   ├── storage_protocol/storage_protocol.fizz # Unified Disk + Engine COW/freelist/MVCC/crash protocol
+│   └── btree_ops/btree_ops.fizz             # Ordered B+Tree & range-scan contract
 ├── engine/                # Core Go storage engine
 │   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, errors
 │   ├── storage.go         # Storage interface, OSFileStorage, per-write fault-injecting MemStorage
@@ -33,19 +31,19 @@ groundkv/
 │   ├── tx.go              # Read-only MVCC Tx & 4-phase single-writer COW Tx
 │   ├── db.go              # DB lifecycle, recovery, active reader tracking, and MBT inspection APIs
 │   └── db_test.go         # Unit, concurrency (-race), mid-commit crash, freelist, and COW tests
-├── fizztests/             # Generated FizzBee MBT harnesses + Go adapters
-│   ├── kv/                # kv_interfaces.go, kv_test.go (generated), kv_adapters.go
-│   ├── btree/             # btree_interfaces.go, btree_test.go (generated), btree_adapters.go
-│   ├── durability/        # durability_interfaces.go, durability_test.go (generated), durability_adapters.go
-│   └── freelist/          # freelist_interfaces.go, freelist_test.go (generated), freelist_adapters.go
+├── fizztests/             # Generated FizzBee MBT harnesses + zero-shadow-state Go adapters
+│   ├── contract/          # kv_contract_{interfaces,test,adapters}.go (parallel + -race)
+│   ├── storage_protocol/  # storage_protocol_{interfaces,test,adapters}.go
+│   └── btree_ops/         # btree_ops_{interfaces,test,adapters}.go
+├── scripts/run_mbt.sh     # Manages fizzbee-mbt-server + fizzbee-mbt-runner lifecycle
 ├── cmd/groundkv/          # Simple CLI (put, get, del, scan, meta, verify)
-├── docs/architecture.md   # Deep dive on disk format, COW B+Tree, and MBT design
+├── docs/architecture.md   # Deep dive on disk format, COW B+Tree, freelist, and MBT design
 └── Makefile               # Spec-first verification & MBT targets
 ```
 
 ## Quick Start
 
-### 1. Model-check the FizzBee specs
+### 1. Model-check all FizzBee specs
 
 The `Makefile` defaults to `FIZZ=$(HOME)/bin/fizzbee-v0.5.4-linux_x86/fizz`:
 
@@ -59,12 +57,9 @@ make check-specs
 make verify
 ```
 
-### 3. Run full FizzBee Model-Based Testing (`go test ./fizztests/...`)
+### 3. Run full FizzBee Model-Based Testing (`make mbt`)
 
-FizzBee MBT executes state-graph traces against the Go adapters via the companion `fizzbee-mbt-runner` binary:
-
-1. Download `fizzbee-mbt-*-linux_x86.tar.gz` from [fizzbee-io/fizzbee-mbt-releases](https://github.com/fizzbee-io/fizzbee-mbt-releases/releases) and place `fizzbee-mbt-runner` on your `PATH` (or pass `FIZZBEE_MBT_BIN=/path/to/fizzbee-mbt-runner`).
-2. Run:
+Download `fizzbee-mbt-*-linux_x86.tar.gz` from [fizzbee-io/fizzbee-mbt-releases](https://github.com/fizzbee-io/fizzbee-mbt-releases/releases), place `fizzbee-mbt-server` and `fizzbee-mbt-runner` on your `PATH`, and run:
 
 ```bash
 make mbt
@@ -76,8 +71,6 @@ make mbt
 make check-specs
 make scaffold-interfaces
 ```
-
-(`scaffold-interfaces` intentionally omits `--gen-adapter` so your hand-written `*_adapters.go` files are preserved while `*_interfaces.go` and `*_test.go` stay synced with the spec.)
 
 ### 5. Try the CLI
 

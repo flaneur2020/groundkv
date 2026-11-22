@@ -49,14 +49,13 @@ Every page (meta, branch, leaf) begins with a uniform header protected by a full
 
 ## 3. FizzBee MBT as a First-Class Citizen
 
-Rather than treating formal methods as documentation written after the fact, GroundKV keeps four executable `.fizz` specifications tightly bound to Go MBT harnesses:
+GroundKV separates **what** the public KV API guarantees (black-box contract) from **how** the storage internals uphold crash safety and MVCC reclamation (white-box protocol), with zero tautological ghost booleans and zero adapter shadow state:
 
-| Spec | Focus | Verified Safety Invariants | Adapter Checks |
-|------|-------|----------------------------|----------------|
-| `models/kv/kv.fizz` | End-to-end KV, MVCC snapshots, explicit write tx commit/rollback, crash & reopen | `DualMetaConsistency`, `NoWriteTxLeak`, `CleanSnapshotState` | Compares real on-disk `DualMeta()`, committed B+Tree, open snapshot `Tx`, staged write `Tx`, and `MemStorage.SimulateCrash()` |
-| `models/btree/btree.fizz` | Append-only COW page immutability, sorted scans, historical pinned snapshots | `AppendOnlyImmutability`, `RootMatchesOracle`, `PinnedSnapshotIntact` | Snapshots raw bytes of every committed page (`pgid >= 2`) and asserts byte-for-byte immutability across all transitions + `db.Validate()` |
-| `models/durability/durability.fizz` | 4-phase mid-commit durability (`WriteDataPages` → `SyncDataPages` → `WriteMetaPage` → `SyncMetaPage`) under unsynced-drop, reordered-meta-flush, and torn-meta-write power losses | `AtLeastOneValidMeta`, `ValidMetaHasDurableData`, `CommittedTxIDNeverRegresses`, `ActiveViewMatchesHighestValidMeta` | Drives `Tx`'s production 4-phase commit methods against per-write fault-injecting `MemStorage`, clones the durable disk image (`CloneDurable`) to verify both meta slots & B+Tree roots after every step |
-| `models/freelist/freelist.fizz` | MVCC reader-aware freelist & page reclamation (`releaseBound = min(txid-1, minActiveReaderTxID)`), on-disk COW freelist chain, crash recovery | `NoLivePageInFreelist`, `PendingStrictlyAboveBound`, `ReleaseBoundRespectsReadersAndDualMeta`, `ReadersConsistent` | Walks every reachable page from `meta0`, `meta1`, and every open MVCC reader (`ReachablePages`) to verify zero overlap with `freelist.free`, exact `minActiveReaderTxID` / `releaseBound`, and intact snapshots |
+| Spec | Layer | Roles & Execution | Verified Safety Invariants & Checks |
+|------|-------|-------------------|-------------------------------------|
+| `models/contract/kv_contract.fizz` | **Black-Box Contract** (zero storage internals) | `Writer#0`, `Reader#0`, `Reader#1`, `SnapshotReader#0` — **parallel MBT (`max-parallel-runs: 200`) under `-race`** | Linearizable `Put`/`Delete`, multi-key atomic `BatchSwap`, isolated `AbortedPut`, concurrent lock-free `Get`/`ScanAll`, and pinned `SnapshotReader` isolation |
+| `models/storage_protocol/storage_protocol.fizz` | **White-Box Protocol** (real abstract `pgid`s + volatile/durable `Disk`) | `Disk#0` + `Engine#0` — 4-phase `CommitStep`, `Put`/`Delete`/`RollbackWrite`, MVCC reader, `Disk.InspectMeta`, and `Disk.Crash(DROP\|REORDERED\|TORN)` | `AtLeastOneValidMeta`, `ValidMetaRootsMatchDurablePages`, `NoLivePageInFreelist`, `ReaderSeesIntactDurablePage`, `CommittedTxIDNeverRegresses` — verified against real `MemStorage.CloneDurable()`, `InspectMeta()`, and `ReachablePages()` with zero adapter shadow state |
+| `models/btree_ops/btree_ops.fizz` | **Data-Structure & Range Query** | `BTree#0` with `MaxLeafKeys=2`, `MaxBranchKeys=2`, and **freelist enabled** | Multi-level splits, deletes, root collapses, empty-tree transitions, and half-open `[start, end)` `ScanRange` correctness + `db.Validate()` |
 
 ### Evolution Roadmap
 
