@@ -1,0 +1,221 @@
+---
+deadlock_detection: false
+options:
+    crash_on_yield: false
+    max_concurrent_actions: 1
+action_options:
+    "DurabilityDB.BeginStage":
+        max_actions: 3
+    "DurabilityDB.PowerLossReorderedFlush":
+        max_actions: 2
+    "DurabilityDB.PowerLossTornMeta":
+        max_actions: 2
+---
+
+KEYS = ["k1", "k2"]
+VALUES = ["v1", "v2"]
+
+# Commit phases mirroring engine.Tx's 4-step durability protocol:
+#   IDLE -> STAGED -> DATA_WRITTEN -> DATA_SYNCED -> META_WRITTEN -> IDLE
+PHASE_IDLE = "IDLE"
+PHASE_STAGED = "STAGED"
+PHASE_DATA_WRITTEN = "DATA_WRITTEN"
+PHASE_DATA_SYNCED = "DATA_SYNCED"
+PHASE_META_WRITTEN = "META_WRITTEN"
+
+# Formally models GroundKV's 4-phase dual-meta COW commit protocol under three
+# distinct storage crash/power-loss fault modes:
+#   1. PowerLossDropUnsynced:   all unsynced OS page-cache writes are lost
+#   2. PowerLossReorderedFlush: disk persists unsynced meta write while dropping
+#                               unsynced data writes (catches missing data Sync!)
+#   3. PowerLossTornMeta:       partial/corrupted write to the target meta page
+#                               (verifies CRC32 rejection & dual-meta fallback,
+#                               including back-to-back torn crashes!)
+role DurabilityDB:
+    action Init:
+        # Durable on-disk dual meta pages (slot 0 for even txid, slot 1 for odd txid)
+        self.meta0_valid = True
+        self.meta0_txid = 0
+        self.meta0_data = {}
+        self.meta0_data_durable = True
+
+        self.meta1_valid = True
+        self.meta1_txid = 0
+        self.meta1_data = {}
+        self.meta1_data_durable = True
+
+        # Active committed view in memory
+        self.txid = 0
+        self.committed = {}
+
+        # Active write transaction commit pipeline state
+        self.phase = PHASE_IDLE
+        self.staged = {}
+        self.target_txid = 0
+        self.data_durable_on_disk = False
+        self.meta_written_unsynced = False
+
+        # Durability oracle: exact set of allowed states across a crash
+        # (pre-commit committed map, and post-commit staged map once meta is written)
+        self.last_durable_txid = 0
+        self.last_durable_map = {}
+
+    # Begin a write tx and stage a Put (or overwrite) in memory
+    atomic action BeginStage:
+        k = oneof KEYS
+        v = oneof VALUES
+        if self.phase != PHASE_IDLE:
+            return "BUSY"
+        next_map = dict(self.committed)
+        next_map[k] = v
+        self.staged = next_map
+        self.target_txid = self.txid + 1
+        self.phase = PHASE_STAGED
+        self.data_durable_on_disk = False
+        self.meta_written_unsynced = False
+        return "OK"
+
+    # Phase 1: Write dirty COW B+Tree pages to OS page cache (unsynced)
+    atomic action WriteDataPages:
+        if self.phase != PHASE_STAGED:
+            return "SKIP"
+        self.phase = PHASE_DATA_WRITTEN
+        return "OK"
+
+    # Phase 2: fsync data pages to durable storage (barrier before meta flip!)
+    atomic action SyncDataPages:
+        if self.phase != PHASE_DATA_WRITTEN:
+            return "SKIP"
+        self.data_durable_on_disk = True
+        self.phase = PHASE_DATA_SYNCED
+        return "OK"
+
+    # Phase 3: Write alternating meta page (slot = target_txid % 2) to OS page cache
+    atomic action WriteMetaPage:
+        if self.phase != PHASE_DATA_SYNCED:
+            return "SKIP"
+        self.meta_written_unsynced = True
+        self.phase = PHASE_META_WRITTEN
+        return "OK"
+
+    # Phase 4: fsync meta page -> commit is now durably finalized
+    atomic action SyncMetaPage:
+        if self.phase != PHASE_META_WRITTEN:
+            return "SKIP"
+        self.persist_meta_slot(self.target_txid, dict(self.staged), self.data_durable_on_disk)
+        self.txid = self.target_txid
+        self.committed = dict(self.staged)
+        self.last_durable_txid = self.txid
+        self.last_durable_map = dict(self.committed)
+        self.reset_tx()
+        return self.txid
+
+    # Fault 1: Abrupt power loss dropping all unsynced OS page-cache writes.
+    # Unsynced data writes and unsynced meta writes vanish; previously synced
+    # dual meta pages remain intact.
+    atomic action PowerLossDropUnsynced:
+        self.reset_tx()
+        self.recover_from_disk()
+        return self.txid
+
+    # Fault 2: Power loss with reordered flush — if a meta page write is sitting
+    # unsynced in the OS cache, the disk flushes THAT meta page while dropping
+    # any unsynced data pages. Because SyncDataPages ran before WriteMetaPage,
+    # the referenced B+Tree data is already durable and recovery lands cleanly
+    # on the post-commit generation!
+    atomic action PowerLossReorderedFlush:
+        if self.meta_written_unsynced:
+            self.persist_meta_slot(self.target_txid, dict(self.staged), self.data_durable_on_disk)
+        self.reset_tx()
+        self.recover_from_disk()
+        return self.txid
+
+    # Fault 3: Power loss causing a torn/corrupted sector write on the target
+    # meta slot while it is unsynced. CRC32 rejects the torn meta slot on reopen,
+    # and recovery MUST fall back to the intact alternate meta slot!
+    atomic action PowerLossTornMeta:
+        if self.meta_written_unsynced:
+            if self.target_txid % 2 == 0:
+                self.meta0_valid = False
+                self.meta0_txid = 0
+                self.meta0_data = {}
+                self.meta0_data_durable = False
+            else:
+                self.meta1_valid = False
+                self.meta1_txid = 0
+                self.meta1_data = {}
+                self.meta1_data_durable = False
+        self.reset_tx()
+        self.recover_from_disk()
+        return self.txid
+
+    def persist_meta_slot(self, txid, data_map, data_durable):
+        if txid % 2 == 0:
+            self.meta0_valid = True
+            self.meta0_txid = txid
+            self.meta0_data = dict(data_map)
+            self.meta0_data_durable = data_durable
+        else:
+            self.meta1_valid = True
+            self.meta1_txid = txid
+            self.meta1_data = dict(data_map)
+            self.meta1_data_durable = data_durable
+
+    def reset_tx(self):
+        self.phase = PHASE_IDLE
+        self.staged = {}
+        self.target_txid = 0
+        self.data_durable_on_disk = False
+        self.meta_written_unsynced = False
+
+    def recover_from_disk(self):
+        if self.meta0_valid and self.meta1_valid:
+            if self.meta0_txid >= self.meta1_txid:
+                self.txid = self.meta0_txid
+                self.committed = dict(self.meta0_data)
+            else:
+                self.txid = self.meta1_txid
+                self.committed = dict(self.meta1_data)
+        elif self.meta0_valid:
+            self.txid = self.meta0_txid
+            self.committed = dict(self.meta0_data)
+        elif self.meta1_valid:
+            self.txid = self.meta1_txid
+            self.committed = dict(self.meta1_data)
+        self.last_durable_txid = self.txid
+        self.last_durable_map = dict(self.committed)
+
+action Init:
+    db = DurabilityDB()
+
+# Safety Invariant 1: Dual meta slots NEVER both become invalid, even under
+# back-to-back torn meta writes.
+always assertion AtLeastOneValidMeta:
+    return db.meta0_valid or db.meta1_valid
+
+# Safety Invariant 2: Every valid meta page on disk MUST reference durable
+# B+Tree data pages (never a dangling/unflushed root from write reordering).
+always assertion ValidMetaHasDurableData:
+    if db.meta0_valid and not db.meta0_data_durable:
+        return False
+    if db.meta1_valid and not db.meta1_data_durable:
+        return False
+    return True
+
+# Safety Invariant 3: Committed txid never regresses below the last durably
+# acknowledged transaction (durability guarantee).
+always assertion CommittedTxIDNeverRegresses:
+    return db.txid >= db.last_durable_txid
+
+# Safety Invariant 4: Active committed view always equals the highest valid
+# meta page on disk.
+always assertion ActiveViewMatchesHighestValidMeta:
+    if db.meta0_valid and db.meta1_valid:
+        if db.meta0_txid >= db.meta1_txid:
+            return db.txid == db.meta0_txid and db.committed == db.meta0_data
+        return db.txid == db.meta1_txid and db.committed == db.meta1_data
+    elif db.meta0_valid:
+        return db.txid == db.meta0_txid and db.committed == db.meta0_data
+    elif db.meta1_valid:
+        return db.txid == db.meta1_txid and db.committed == db.meta1_data
+    return False

@@ -1,0 +1,72 @@
+name: FizzBee MBT & Engine CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FIZZBEE_VERSION: "0.5.4"
+  FIZZBEE_MBT_VERSION: "0.2.0"
+
+jobs:
+  mbt:
+    name: Model Check, Engine Race Tests & FizzBee MBT
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache FizzBee & FizzBee-MBT binaries
+        id: cache-fizzbee
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/fizzbee-tools
+          key: fizzbee-${{ env.FIZZBEE_VERSION }}-mbt-${{ env.FIZZBEE_MBT_VERSION }}-linux_x86
+
+      - name: Install FizzBee & FizzBee-MBT
+        if: steps.cache-fizzbee.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          TOOLS_DIR="$HOME/.local/fizzbee-tools"
+          mkdir -p "$TOOLS_DIR"
+
+          curl -fsSL \
+            "https://github.com/fizzbee-io/fizzbee/releases/download/v${FIZZBEE_VERSION}/fizzbee-v${FIZZBEE_VERSION}-linux_x86.tar.gz" \
+            -o /tmp/fizzbee.tar.gz
+          tar -xzf /tmp/fizzbee.tar.gz -C "$TOOLS_DIR"
+          rm -f /tmp/fizzbee.tar.gz
+
+          curl -fsSL \
+            "https://github.com/fizzbee-io/fizzbee-mbt-releases/releases/download/v${FIZZBEE_MBT_VERSION}/fizzbee-mbt-${FIZZBEE_MBT_VERSION}-linux_x86.tar.gz" \
+            -o /tmp/fizzbee-mbt.tar.gz
+          tar -xzf /tmp/fizzbee-mbt.tar.gz -C "$TOOLS_DIR"
+          rm -f /tmp/fizzbee-mbt.tar.gz
+
+      - name: Add FizzBee tools to PATH
+        run: |
+          TOOLS_DIR="$HOME/.local/fizzbee-tools"
+          echo "$TOOLS_DIR/fizzbee-v${FIZZBEE_VERSION}-linux_x86" >> "$GITHUB_PATH"
+          echo "$TOOLS_DIR/fizzbee-mbt-${FIZZBEE_MBT_VERSION}-linux_x86" >> "$GITHUB_PATH"
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Engine unit, crash-recovery & race tests
+        run: make race
+
+      - name: Model-check all FizzBee specs
+        run: make FIZZ=fizz check-specs
+
+      - name: Run FizzBee Model-Based Testing (kv, btree, durability)
+        run: make FIZZ=fizz FIZZBEE_MBT_SERVER=fizzbee-mbt-server FIZZBEE_MBT_BIN=fizzbee-mbt-runner mbt-kv mbt-btree mbt-durability

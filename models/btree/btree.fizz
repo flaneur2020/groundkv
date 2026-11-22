@@ -1,0 +1,116 @@
+---
+deadlock_detection: false
+options:
+    crash_on_yield: false
+    max_concurrent_actions: 1
+action_options:
+    "CowBTree.Put":
+        max_actions: 3
+    "CowBTree.Delete":
+        max_actions: 1
+    "CowBTree.PinSnapshot":
+        max_actions: 1
+---
+
+NOT_FOUND = "NOT_FOUND"
+KEYS = ["a", "b", "c"]
+
+# Models the append-only / copy-on-write (COW) page allocation discipline of
+# GroundKV's B+Tree:
+# - Every committed page is immutable forever while reachable from any active
+#   root or pinned snapshot.
+# - Every Put/Delete allocates a fresh root generation without mutating
+#   previously written page contents.
+# - Pinned snapshots always resolve lookups identically to their point-in-time
+#   reference map, even after subsequent Put/Delete operations allocate new roots.
+role CowBTree:
+    action Init:
+        # Page generations: gen -> immutable dict of entries representing the committed tree
+        self.generations = {0: {}}
+        self.root_gen = 0
+
+        # Reference oracle map for the latest root
+        self.ref = {}
+
+        # Pinned snapshot generation (-1 when none is pinned)
+        self.pinned_gen = -1
+        self.pinned_ref = {}
+
+        # Ghost flag: set False if any previously written generation was ever overwritten
+        self.pages_immutable = True
+
+    atomic action Put:
+        k = oneof KEYS
+        old_data = self.generations[self.root_gen]
+        new_gen = self.root_gen + 1
+        v = "v" + str(new_gen)
+        new_data = dict(old_data)
+        new_data[k] = v
+
+        # Append-only COW: allocate a strictly new generation
+        if new_gen in self.generations:
+            self.pages_immutable = False
+        self.generations[new_gen] = new_data
+        self.root_gen = new_gen
+
+        self.ref[k] = v
+        return new_gen
+
+    atomic action Delete:
+        k = oneof KEYS
+        old_data = self.generations[self.root_gen]
+        new_data = dict(old_data)
+        if k in new_data:
+            new_data.pop(k)
+
+        new_gen = self.root_gen + 1
+        if new_gen in self.generations:
+            self.pages_immutable = False
+        self.generations[new_gen] = new_data
+        self.root_gen = new_gen
+
+        if k in self.ref:
+            self.ref.pop(k)
+        return new_gen
+
+    atomic action Get:
+        k = oneof KEYS
+        return self.generations[self.root_gen].get(k, NOT_FOUND)
+
+    atomic action ScanKeys:
+        return ",".join(sorted(self.generations[self.root_gen].keys()))
+
+    atomic action PinSnapshot:
+        if self.pinned_gen >= 0:
+            return -1
+        self.pinned_gen = self.root_gen
+        self.pinned_ref = dict(self.ref)
+        return self.pinned_gen
+
+    atomic action ReadPinned:
+        k = oneof KEYS
+        if self.pinned_gen < 0:
+            return NOT_FOUND
+        return self.generations[self.pinned_gen].get(k, NOT_FOUND)
+
+action Init:
+    tree = CowBTree()
+
+# Safety Invariant 1: Append-only page immutability is never violated.
+always assertion AppendOnlyImmutability:
+    return tree.pages_immutable
+
+# Safety Invariant 2: Current root generation exists and matches reference map.
+always assertion RootMatchesOracle:
+    if tree.root_gen not in tree.generations:
+        return False
+    return tree.generations[tree.root_gen] == tree.ref
+
+# Safety Invariant 3: Pinned snapshot root still resolves identically
+# to its point-in-time state.
+always assertion PinnedSnapshotIntact:
+    if tree.pinned_gen < 0:
+        return True
+    if tree.pinned_gen not in tree.generations:
+        return False
+    return tree.generations[tree.pinned_gen] == tree.pinned_ref
