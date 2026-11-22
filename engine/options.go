@@ -39,6 +39,11 @@ type Options struct {
 
 	// NoSync disables fsync calls on commit. Leave false for crash durability.
 	NoSync bool
+
+	// NoFreelist disables page reclamation, keeping the database strictly
+	// append-only so every historical root remains readable without pinning an
+	// MVCC reader. Leave false (default) to reclaim freed pages like BoltDB.
+	NoFreelist bool
 }
 
 func (o *Options) withDefaults() (Options, error) {

@@ -24,16 +24,26 @@ type Tx struct {
 	phase    txCommitPhase
 
 	// meta is a private copy pinned when the transaction begins. For a write
-	// transaction, meta.Root and meta.HighWater advance in memory as COW pages
-	// are allocated; meta.TxID is incremented during Commit.
+	// transaction, meta.Root, meta.Freelist, and meta.HighWater advance in memory
+	// as COW pages are allocated; meta.TxID is incremented during Commit.
 	meta Meta
 
 	// nextMeta holds the pending committed Meta between WriteMetaPage and SyncMetaPage.
 	nextMeta Meta
 
 	// dirty holds freshly allocated COW pages for a write transaction. None of
-	// these pages overwrite existing committed pages.
+	// these pages overwrite pages reachable from any live meta page or reader.
 	dirty map[PageID][]byte
+
+	// freed tracks page IDs made unreachable by this write transaction.
+	freed map[PageID]struct{}
+
+	// recycled tracks page IDs popped from db.freelist.free during this write tx
+	// so Rollback can return them cleanly without leaking pages.
+	recycled []PageID
+
+	// newFreelistPages tracks the page IDs of the newly written freelist chain.
+	newFreelistPages []PageID
 }
 
 // Writable reports whether this transaction permits mutations.
@@ -87,7 +97,7 @@ func (tx *Tx) All() (map[string]string, error) {
 	return out, nil
 }
 
-// Put inserts or updates key with value using append-only copy-on-write page allocation.
+// Put inserts or updates key with value using copy-on-write page allocation.
 func (tx *Tx) Put(key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
@@ -106,7 +116,7 @@ func (tx *Tx) Put(key, value []byte) error {
 	return nil
 }
 
-// Delete removes key from the B+Tree using append-only copy-on-write page allocation.
+// Delete removes key from the B+Tree using copy-on-write page allocation.
 // Deleting a non-existent key is a no-op.
 func (tx *Tx) Delete(key []byte) error {
 	if tx.closed {
@@ -136,10 +146,10 @@ func (tx *Tx) Validate() error {
 
 // Commit atomically persists all COW pages allocated by a write transaction
 // by executing the 4 durability phases in strict order:
-//  1. WriteDataPages — append dirty B+Tree pages at newly allocated PageIDs.
+//  1. WriteDataPages — write dirty B+Tree pages + COW freelist pages.
 //  2. SyncDataPages  — fsync data pages BEFORE touching either meta page.
 //  3. WriteMetaPage  — write the alternate meta slot (newTxID % 2).
-//  4. SyncMetaPage   — fsync the meta page and publish in memory.
+//  4. SyncMetaPage   — fsync the meta page, update freelist, and publish in memory.
 func (tx *Tx) Commit() error {
 	if err := tx.WriteDataPages(); err != nil {
 		return err
@@ -153,10 +163,8 @@ func (tx *Tx) Commit() error {
 	return tx.SyncMetaPage()
 }
 
-// WriteDataPages executes Commit Phase 1: writes all dirty COW pages in
-// ascending PageID order without syncing yet. Exposed so durability tests and
-// FizzBee MBT harnesses can inject crashes between commit phases directly on
-// the production commit path.
+// WriteDataPages executes Commit Phase 1: encodes the COW freelist chain (when
+// enabled) and writes all dirty COW pages in ascending PageID order without syncing yet.
 func (tx *Tx) WriteDataPages() error {
 	if tx.closed {
 		return ErrTxClosed
@@ -166,6 +174,12 @@ func (tx *Tx) WriteDataPages() error {
 	}
 	if tx.phase != txPhaseActive {
 		return errors.New("groundkv: WriteDataPages called out of order")
+	}
+
+	if !tx.db.opts.NoFreelist {
+		if err := tx.prepareFreelistPages(); err != nil {
+			return err
+		}
 	}
 
 	if len(tx.dirty) > 0 {
@@ -187,8 +201,65 @@ func (tx *Tx) WriteDataPages() error {
 	return nil
 }
 
-// SyncDataPages executes Commit Phase 2: fsyncs appended B+Tree data pages so
-// they are guaranteed durable before the alternate meta page is written.
+func (tx *Tx) prepareFreelistPages() error {
+	tx.db.mu.Lock()
+	// Free the previous committed freelist chain pages (COW on the freelist itself).
+	for _, oldID := range tx.db.freelistPages {
+		if oldID >= 2 {
+			tx.freed[oldID] = struct{}{}
+		}
+	}
+	initialAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
+	tx.db.mu.Unlock()
+
+	if len(initialAll) == 0 {
+		tx.meta.Freelist = 0
+		tx.newFreelistPages = nil
+		return nil
+	}
+
+	perPage := maxFreelistIDsPerPage(tx.pageSize())
+	numPages := (len(initialAll) + perPage - 1) / perPage
+
+	chainIDs := make([]PageID, numPages)
+	for i := 0; i < numPages; i++ {
+		chainIDs[i] = tx.allocPageID()
+	}
+
+	// Recompute after allocating chainIDs (popping from free only shrinks the list,
+	// so it always fits in numPages and never includes any live chainID).
+	tx.db.mu.Lock()
+	finalAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
+	tx.db.mu.Unlock()
+
+	for i, pgid := range chainIDs {
+		start := i * perPage
+		var chunk []PageID
+		if start < len(finalAll) {
+			end := start + perPage
+			if end > len(finalAll) {
+				end = len(finalAll)
+			}
+			chunk = finalAll[start:end]
+		}
+		var next PageID
+		if i+1 < len(chainIDs) {
+			next = chainIDs[i+1]
+		}
+		buf, err := encodeFreelistPage(tx.pageSize(), pgid, tx.txid(), next, chunk)
+		if err != nil {
+			return err
+		}
+		tx.dirty[pgid] = buf
+	}
+
+	tx.meta.Freelist = chainIDs[0]
+	tx.newFreelistPages = chainIDs
+	return nil
+}
+
+// SyncDataPages executes Commit Phase 2: fsyncs appended/recycled B+Tree and
+// freelist data pages so they are guaranteed durable before the alternate meta page is written.
 func (tx *Tx) SyncDataPages() error {
 	if tx.closed {
 		return ErrTxClosed
@@ -234,8 +305,9 @@ func (tx *Tx) WriteMetaPage() error {
 	return nil
 }
 
-// SyncMetaPage executes Commit Phase 4: fsyncs the alternate meta page and
-// publishes the newly committed Meta to subsequent readers.
+// SyncMetaPage executes Commit Phase 4: fsyncs the alternate meta page, updates
+// the freelist pending/reclaimed state, releases eligible pages under the current
+// MVCC & dual-meta barrier, and publishes the newly committed Meta.
 func (tx *Tx) SyncMetaPage() error {
 	if tx.closed {
 		return ErrTxClosed
@@ -254,37 +326,73 @@ func (tx *Tx) SyncMetaPage() error {
 		}
 	}
 
+	freedList := tx.freedSlice()
+
 	tx.db.mu.Lock()
 	tx.db.meta = tx.nextMeta
+	if !tx.db.opts.NoFreelist {
+		tx.db.freelist.addPending(tx.nextMeta.TxID, freedList)
+		tx.db.freelist.reclaimedRuns += uint64(len(tx.recycled))
+		tx.db.freelistPages = tx.newFreelistPages
+		tx.db.freelist.release(tx.db.releaseBoundLocked())
+	}
 	tx.db.writeTx = nil
 	tx.db.mu.Unlock()
 
 	tx.closed = true
 	tx.dirty = nil
+	tx.freed = nil
+	tx.recycled = nil
 	return nil
 }
 
 // Rollback closes the transaction without committing any changes.
-// For write transactions, all dirty COW pages are discarded without touching disk.
+// For write transactions, all dirty COW pages are discarded and any pages
+// popped from the freelist are returned cleanly without touching disk.
+// For read transactions, closing may advance minActiveReaderTxID and release
+// newly eligible pending pages into the reusable free pool.
 func (tx *Tx) Rollback() error {
 	if tx.closed {
 		return nil
 	}
 	tx.closed = true
-	tx.dirty = nil
 
 	tx.db.mu.Lock()
 	if tx.writable {
+		if !tx.db.opts.NoFreelist && len(tx.recycled) > 0 {
+			tx.db.freelist.returnToFree(tx.recycled)
+		}
 		if tx.db.writeTx == tx {
 			tx.db.writeTx = nil
 		}
 	} else {
-		if tx.db.activeReaders > 0 {
-			tx.db.activeReaders--
+		if c := tx.db.readerCounts[tx.meta.TxID]; c <= 1 {
+			delete(tx.db.readerCounts, tx.meta.TxID)
+		} else {
+			tx.db.readerCounts[tx.meta.TxID] = c - 1
+		}
+		if !tx.db.opts.NoFreelist {
+			tx.db.freelist.release(tx.db.releaseBoundLocked())
 		}
 	}
 	tx.db.mu.Unlock()
+
+	tx.dirty = nil
+	tx.freed = nil
+	tx.recycled = nil
 	return nil
+}
+
+func (tx *Tx) freedSlice() []PageID {
+	if len(tx.freed) == 0 {
+		return nil
+	}
+	out := make([]PageID, 0, len(tx.freed))
+	for id := range tx.freed {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // --- pageAccess implementation ---
@@ -304,13 +412,39 @@ func (tx *Tx) readPage(pgid PageID) ([]byte, pageHeader, error) {
 	return tx.db.readCommittedPage(pgid)
 }
 
-func (tx *Tx) allocPage(encode func(pgid PageID) ([]byte, error)) (PageID, error) {
+func (tx *Tx) allocPageID() PageID {
+	if !tx.db.opts.NoFreelist {
+		tx.db.mu.Lock()
+		pgid, ok := tx.db.freelist.pop()
+		tx.db.mu.Unlock()
+		if ok {
+			tx.recycled = append(tx.recycled, pgid)
+			return pgid
+		}
+	}
 	pgid := tx.meta.HighWater
+	tx.meta.HighWater++
+	return pgid
+}
+
+func (tx *Tx) allocPage(encode func(pgid PageID) ([]byte, error)) (PageID, error) {
+	pgid := tx.allocPageID()
 	buf, err := encode(pgid)
 	if err != nil {
 		return 0, err
 	}
-	tx.meta.HighWater++
 	tx.dirty[pgid] = buf
 	return pgid, nil
+}
+
+func (tx *Tx) freePage(pgid PageID) {
+	if pgid < 2 || tx.db.opts.NoFreelist {
+		return
+	}
+	// If pgid was allocated earlier in this same uncommitted write tx, drop its
+	// obsolete dirty buffer so we don't write dead pages to disk.
+	delete(tx.dirty, pgid)
+	if tx.freed != nil {
+		tx.freed[pgid] = struct{}{}
+	}
 }

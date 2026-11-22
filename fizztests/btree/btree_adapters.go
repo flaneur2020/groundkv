@@ -49,6 +49,7 @@ func newCowBTreeRoleAdapter() (*CowBTreeRoleAdapter, error) {
 		PageSize:      512,
 		MaxLeafKeys:   2, // With 3 keys ("a", "b", "c"), Put forces real leaf splits & root promotion!
 		MaxBranchKeys: 2,
+		NoFreelist:    true, // btree.fizz inspects all unpinned historical roots gen=0..N
 	}
 	db, err := engine.OpenStorage(st, opts)
 	if err != nil {

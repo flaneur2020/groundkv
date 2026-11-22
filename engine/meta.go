@@ -8,8 +8,8 @@ import (
 const (
 	metaMagic   uint32 = 0x47524B56 // "GRKV"
 	metaVersion uint32 = 1
-	// metaPayloadSize: magic(4) + version(4) + pageSize(4) + reserved(4) + root(8) + highWater(8) + txid(8) = 40
-	metaPayloadSize = 40
+	// metaPayloadSize: magic(4) + version(4) + pageSize(4) + reserved(4) + root(8) + highWater(8) + txid(8) + freelist(8) = 48
+	metaPayloadSize = 48
 )
 
 // Meta represents the superblock stored in Page 0 and Page 1.
@@ -22,6 +22,7 @@ type Meta struct {
 	Root      PageID
 	HighWater PageID
 	TxID      uint64
+	Freelist  PageID
 }
 
 func metaSlot(txid uint64) PageID {
@@ -38,6 +39,7 @@ func encodeMetaPage(pageSize int, slot PageID, m Meta) []byte {
 	binary.LittleEndian.PutUint64(buf[off+16:off+24], uint64(m.Root))
 	binary.LittleEndian.PutUint64(buf[off+24:off+32], uint64(m.HighWater))
 	binary.LittleEndian.PutUint64(buf[off+32:off+40], m.TxID)
+	binary.LittleEndian.PutUint64(buf[off+40:off+48], uint64(m.Freelist))
 
 	writePageHeader(buf, pageHeader{
 		pgid:  slot,
@@ -64,6 +66,7 @@ func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
 		Root:      PageID(binary.LittleEndian.Uint64(buf[off+16 : off+24])),
 		HighWater: PageID(binary.LittleEndian.Uint64(buf[off+24 : off+32])),
 		TxID:      binary.LittleEndian.Uint64(buf[off+32 : off+40]),
+		Freelist:  PageID(binary.LittleEndian.Uint64(buf[off+40 : off+48])),
 	}
 	if m.Magic != metaMagic || m.Version != metaVersion {
 		return Meta{}, fmt.Errorf("%w: magic/version mismatch on meta %d", ErrCorruptedMeta, slot)
@@ -73,6 +76,9 @@ func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
 	}
 	if m.Root != 0 && (m.Root < 2 || m.Root >= m.HighWater) {
 		return Meta{}, fmt.Errorf("%w: invalid root %d (highWater %d) on meta %d", ErrCorruptedMeta, m.Root, m.HighWater, slot)
+	}
+	if m.Freelist != 0 && (m.Freelist < 2 || m.Freelist >= m.HighWater) {
+		return Meta{}, fmt.Errorf("%w: invalid freelist %d (highWater %d) on meta %d", ErrCorruptedMeta, m.Freelist, m.HighWater, slot)
 	}
 	return m, nil
 }

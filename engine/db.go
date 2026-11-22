@@ -2,10 +2,12 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
-// DB is a BoltDB-inspired embedded KV store backed by an append-only COW B+Tree.
+// DB is a BoltDB-inspired embedded KV store backed by a copy-on-write B+Tree
+// with MVCC reader-aware freelist page reclamation.
 // It supports multiple concurrent MVCC readers and a single serialized writer.
 type DB struct {
 	mu            sync.RWMutex
@@ -13,7 +15,9 @@ type DB struct {
 	opts          Options
 	meta          Meta
 	writeTx       *Tx
-	activeReaders int
+	readerCounts  map[uint64]int
+	freelist      *freelist
+	freelistPages []PageID
 	closed        bool
 }
 
@@ -44,8 +48,10 @@ func OpenStorage(st Storage, opts *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		storage: st,
-		opts:    cfg,
+		storage:      st,
+		opts:         cfg,
+		readerCounts: make(map[uint64]int),
+		freelist:     newFreelist(),
 	}
 
 	if size == 0 {
@@ -69,6 +75,7 @@ func (db *DB) initEmpty() error {
 		Root:      0,
 		HighWater: 2,
 		TxID:      0,
+		Freelist:  0,
 	}
 	for slot := PageID(0); slot < 2; slot++ {
 		buf := encodeMetaPage(db.opts.PageSize, slot, m)
@@ -96,6 +103,7 @@ func (db *DB) recover() error {
 	}
 
 	var lastErr0, lastErr1 error
+	recovered := false
 	for _, ps := range candidateSizes {
 		meta0, err0 := db.readMetaSlotWithSize(0, ps)
 		meta1, err1 := db.readMetaSlotWithSize(1, ps)
@@ -115,23 +123,41 @@ func (db *DB) recover() error {
 				db.meta = meta1
 			}
 			db.opts.PageSize = ps
-			return nil
+			recovered = true
 		case err0 == nil:
 			db.meta = meta0
 			db.opts.PageSize = ps
-			return nil
+			recovered = true
 		case err1 == nil:
 			db.meta = meta1
 			db.opts.PageSize = ps
-			return nil
+			recovered = true
 		default:
 			if ps == db.opts.PageSize {
 				lastErr0, lastErr1 = err0, err1
 			}
 		}
+		if recovered {
+			break
+		}
 	}
 
-	return fmt.Errorf("%w: meta0=(%v), meta1=(%v)", ErrCorruptedMeta, lastErr0, lastErr1)
+	if !recovered {
+		return fmt.Errorf("%w: meta0=(%v), meta1=(%v)", ErrCorruptedMeta, lastErr0, lastErr1)
+	}
+
+	// Reload on-disk freelist into pending[activeMeta.TxID] so pages that may
+	// still be referenced by the older meta slot (txid-1) are protected until
+	// the next commit rotates the older meta slot.
+	if !db.opts.NoFreelist && db.meta.Freelist != 0 {
+		freedIDs, chainPages, err := db.readFreelistChain(db.meta.Freelist)
+		if err != nil {
+			return fmt.Errorf("groundkv: recover freelist: %w", err)
+		}
+		db.freelistPages = chainPages
+		db.freelist.addPending(db.meta.TxID, freedIDs)
+	}
+	return nil
 }
 
 func (db *DB) readMetaSlot(slot PageID) (Meta, error) {
@@ -158,6 +184,132 @@ func (db *DB) readCommittedPage(pgid PageID) ([]byte, pageHeader, error) {
 	return buf, h, err
 }
 
+func (db *DB) minActiveReaderTxIDLocked() (uint64, bool) {
+	if len(db.readerCounts) == 0 {
+		return 0, false
+	}
+	var minTx uint64
+	first := true
+	for txid, c := range db.readerCounts {
+		if c <= 0 {
+			continue
+		}
+		if first || txid < minTx {
+			minTx = txid
+			first = false
+		}
+	}
+	if first {
+		return 0, false
+	}
+	return minTx, true
+}
+
+// releaseBoundLocked returns the highest freeTxID whose freed pages are safe
+// to recycle without overwriting any page reachable from either on-disk meta
+// slot (currentTxID and currentTxID-1) or any open MVCC read snapshot.
+func (db *DB) releaseBoundLocked() uint64 {
+	var bound uint64
+	if db.meta.TxID > 0 {
+		bound = db.meta.TxID - 1
+	}
+	if minR, ok := db.minActiveReaderTxIDLocked(); ok && minR < bound {
+		bound = minR
+	}
+	return bound
+}
+
+// MinActiveReaderTxID returns the lowest TxID among currently open read-only
+// MVCC snapshots, or (0, false) if no read snapshots are open.
+func (db *DB) MinActiveReaderTxID() (uint64, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.minActiveReaderTxIDLocked()
+}
+
+// ReleaseBound returns the current MVCC + dual-meta freelist reclamation bound.
+func (db *DB) ReleaseBound() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.releaseBoundLocked()
+}
+
+// FreelistSnapshot summarizes the live freelist state for diagnostics and MBT.
+type FreelistSnapshot struct {
+	FreeIDs       []PageID
+	PendingTxIDs  []uint64
+	ReclaimedHits uint64
+}
+
+// FreelistState returns a consistent snapshot of the freelist's free pool,
+// pending transaction IDs, and total recycled page allocations.
+func (db *DB) FreelistState() FreelistSnapshot {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return FreelistSnapshot{
+		FreeIDs:       db.freelist.freeIDs(),
+		PendingTxIDs:  db.freelist.pendingTxIDs(),
+		ReclaimedHits: db.freelist.reclaimedRuns,
+	}
+}
+
+// ReachablePages returns all page IDs reachable from the given B+Tree root and
+// optional freelist chain head. Used by tests and FizzBee MBT to assert that no
+// reachable page is ever present in the reusable free pool.
+func (db *DB) ReachablePages(root PageID, freelistHead PageID) ([]PageID, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDBClosed
+	}
+
+	visited := make(map[PageID]bool)
+	if root != 0 {
+		if err := db.collectTreePagesLocked(root, visited); err != nil {
+			return nil, err
+		}
+	}
+	if freelistHead != 0 {
+		_, chainPages, err := db.readFreelistChain(freelistHead)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range chainPages {
+			visited[id] = true
+		}
+	}
+
+	out := make([]PageID, 0, len(visited))
+	for id := range visited {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+func (db *DB) collectTreePagesLocked(pgid PageID, visited map[PageID]bool) error {
+	if visited[pgid] {
+		return nil
+	}
+	visited[pgid] = true
+	buf, h, err := db.readCommittedPage(pgid)
+	if err != nil {
+		return err
+	}
+	if h.flags == PageFlagBranch {
+		entries, err := decodeBranchPage(buf, h)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if err := db.collectTreePagesLocked(e.child, visited); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // BeginRead starts a read-only MVCC snapshot transaction pinned to the latest committed TxID.
 func (db *DB) BeginRead() (*Tx, error) {
 	db.mu.Lock()
@@ -165,7 +317,7 @@ func (db *DB) BeginRead() (*Tx, error) {
 	if db.closed {
 		return nil, ErrDBClosed
 	}
-	db.activeReaders++
+	db.readerCounts[db.meta.TxID]++
 	return &Tx{
 		db:       db,
 		writable: false,
@@ -184,11 +336,15 @@ func (db *DB) BeginWrite() (*Tx, error) {
 	if db.writeTx != nil {
 		return nil, ErrWriteTxActive
 	}
+	if !db.opts.NoFreelist {
+		db.freelist.release(db.releaseBoundLocked())
+	}
 	tx := &Tx{
 		db:       db,
 		writable: true,
 		meta:     db.meta,
 		dirty:    make(map[PageID][]byte),
+		freed:    make(map[PageID]struct{}),
 	}
 	db.writeTx = tx
 	return tx, nil

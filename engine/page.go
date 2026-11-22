@@ -11,9 +11,10 @@ import (
 type PageID uint64
 
 const (
-	PageFlagMeta   uint16 = 0x01
-	PageFlagBranch uint16 = 0x02
-	PageFlagLeaf   uint16 = 0x04
+	PageFlagMeta     uint16 = 0x01
+	PageFlagBranch   uint16 = 0x02
+	PageFlagLeaf     uint16 = 0x04
+	PageFlagFreelist uint16 = 0x08
 
 	// pageHeaderSize is the fixed on-disk page header size in bytes:
 	//   [0:8]   pgid     (uint64)

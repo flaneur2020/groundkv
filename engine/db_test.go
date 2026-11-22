@@ -240,6 +240,7 @@ func TestAppendOnlyCOWPageImmutabilityProperty(t *testing.T) {
 		PageSize:      512,
 		MaxLeafKeys:   2,
 		MaxBranchKeys: 2,
+		NoFreelist:    true, // Pure append-only mode: every historical page remains immutable forever
 	})
 	if err != nil {
 		t.Fatalf("OpenStorage: %v", err)
@@ -449,4 +450,106 @@ func TestMidCommitCrashDurabilityAndWriteReordering(t *testing.T) {
 			t.Fatalf("expected Validate() to catch dangling root when data Sync barrier was skipped")
 		}
 	})
+}
+
+func TestFreelistReclamationAndMVCCReaderBarrier(t *testing.T) {
+	opts := &engine.Options{PageSize: 512, MaxLeafKeys: 2, MaxBranchKeys: 2}
+	st := engine.NewMemStorage()
+	db, err := engine.OpenStorage(st, opts)
+	if err != nil {
+		t.Fatalf("OpenStorage: %v", err)
+	}
+
+	// 1. Pin MVCC reader at txid=1 and verify its pages are NOT recycled across
+	// many subsequent commits while it remains open.
+	if err := db.Put([]byte("k1"), []byte("orig")); err != nil {
+		t.Fatalf("Put orig: %v", err)
+	}
+	r1, err := db.BeginRead()
+	if err != nil {
+		t.Fatalf("BeginRead r1: %v", err)
+	}
+
+	for i := 0; i < 15; i++ {
+		if err := db.Put([]byte("k1"), []byte(fmt.Sprintf("val-%d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+		if err := db.Put([]byte("k2"), []byte(fmt.Sprintf("other-%d", i))); err != nil {
+			t.Fatalf("Put k2 %d: %v", i, err)
+		}
+	}
+
+	if got, err := r1.Get([]byte("k1")); err != nil || string(got) != "orig" {
+		t.Fatalf("r1.Get(k1) = (%q, %v), want orig", got, err)
+	}
+	if fl := db.FreelistState(); fl.ReclaimedHits != 0 {
+		t.Fatalf("expected 0 reclaimed pages while reader at txid=1 is open, got %d", fl.ReclaimedHits)
+	}
+
+	// 2. Closing r1 immediately releases pending pages into free.
+	if err := r1.Rollback(); err != nil {
+		t.Fatalf("r1.Rollback: %v", err)
+	}
+	flAfterClose := db.FreelistState()
+	if len(flAfterClose.FreeIDs) == 0 {
+		t.Fatalf("expected freed pages to be released after closing r1")
+	}
+
+	// 3. Verify write tx Rollback returns popped free pages without leaking.
+	freeBeforeRollback := len(flAfterClose.FreeIDs)
+	wtx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatalf("BeginWrite: %v", err)
+	}
+	if err := wtx.Put([]byte("k3"), []byte("temp")); err != nil {
+		t.Fatalf("wtx.Put: %v", err)
+	}
+	if err := wtx.Rollback(); err != nil {
+		t.Fatalf("wtx.Rollback: %v", err)
+	}
+	if got := len(db.FreelistState().FreeIDs); got != freeBeforeRollback {
+		t.Fatalf("free count after write rollback = %d, want %d", got, freeBeforeRollback)
+	}
+
+	// 4. Steady-state overwrites recycle freed pages so HighWater stops growing!
+	hwBefore := db.Meta().HighWater
+	for i := 0; i < 40; i++ {
+		if err := db.Put([]byte("k1"), []byte(fmt.Sprintf("steady-%d", i))); err != nil {
+			t.Fatalf("steady Put %d: %v", i, err)
+		}
+		if err := db.Validate(); err != nil {
+			t.Fatalf("steady Validate %d: %v", i, err)
+		}
+	}
+	flSteady := db.FreelistState()
+	if flSteady.ReclaimedHits == 0 {
+		t.Fatalf("expected pages to be reclaimed during steady-state writes")
+	}
+	if db.Meta().HighWater > hwBefore+4 {
+		t.Fatalf("HighWater grew unboundedly despite freelist reclamation: before=%d, after=%d", hwBefore, db.Meta().HighWater)
+	}
+
+	// 5. Crash & reopen reloads on-disk Meta.Freelist and reclaims pages on subsequent writes.
+	st2 := st.SimulateCrash()
+	db2, err := engine.OpenStorage(st2, opts)
+	if err != nil {
+		t.Fatalf("Reopen after crash: %v", err)
+	}
+	defer db2.Close()
+
+	if err := db2.Validate(); err != nil {
+		t.Fatalf("Validate after reopen: %v", err)
+	}
+	hwReopen := db2.Meta().HighWater
+	for i := 0; i < 10; i++ {
+		if err := db2.Put([]byte("k1"), []byte(fmt.Sprintf("post-crash-%d", i))); err != nil {
+			t.Fatalf("post-crash Put %d: %v", i, err)
+		}
+	}
+	if db2.FreelistState().ReclaimedHits == 0 {
+		t.Fatalf("expected recovered on-disk freelist pages to be reclaimed after reopen")
+	}
+	if db2.Meta().HighWater > hwReopen+6 {
+		t.Fatalf("HighWater grew unexpectedly after reopen: before=%d, after=%d", hwReopen, db2.Meta().HighWater)
+	}
 }

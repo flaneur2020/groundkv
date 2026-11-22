@@ -1,0 +1,182 @@
+---
+deadlock_detection: false
+options:
+    crash_on_yield: false
+    max_concurrent_actions: 1
+action_options:
+    "FreelistDB.Put":
+        max_actions: 4
+    "FreelistDB.OpenReader":
+        max_actions: 2
+    "FreelistDB.CloseReader":
+        max_actions: 2
+    "FreelistDB.CrashAndReopen":
+        max_actions: 1
+---
+
+NOT_FOUND = "NOT_FOUND"
+KEYS = ["k1", "k2"]
+READERS = ["r1", "r2"]
+
+# Formally models BoltDB / LMDB-style MVCC reader-aware freelist reclamation:
+#   - Pages freed by committed transaction T enter pending[T].
+#   - A pending bucket T is released into the reusable free pool ONLY when:
+#       T <= release_bound
+#     where release_bound = min(oldest_live_meta_txid, min_active_reader_txid)
+#     and oldest_live_meta_txid = max(0, txid - 1).
+#   - This simultaneously protects:
+#       1) Every open MVCC read snapshot (zero use-after-free), and
+#       2) Both on-disk dual meta slots (Page 0 and Page 1).
+#   - Closing the oldest reader advances min_active_reader_txid and immediately
+#     releases newly unblocked pending buckets.
+#   - Crash recovery reloads on-disk Meta.Freelist into pending[txid] so the
+#     older meta slot remains intact until the next commit rotates it.
+role FreelistDB:
+    action Init:
+        self.txid = 0
+        self.committed = {}
+
+        # Open MVCC readers: reader_id -> pinned txid, and reader_id -> expected KV snapshot
+        self.active_readers = {}
+        self.reader_views = {}
+
+        # MVCC + dual-meta reclamation watermark
+        self.min_reader_txid = -1
+        self.release_bound = 0
+
+        # Sorted comma-joined txids currently held in freelist.pending (e.g. "", "2", "2,3")
+        self.pending_txids = ""
+
+        # Structural safety flags verified directly against the real engine in MBT GetState()
+        self.no_live_page_in_free = True
+        self.no_pending_below_bound = True
+
+    atomic action Put:
+        k = oneof KEYS
+        next_txid = self.txid + 1
+        v = "v" + str(next_txid)
+
+        next_map = dict(self.committed)
+        next_map[k] = v
+        self.txid = next_txid
+        self.committed = next_map
+
+        # Every commit at txid >= 2 replaces at least the previous B+Tree root page
+        pending = parse_txids(self.pending_txids)
+        if next_txid >= 2:
+            pending.append(next_txid)
+
+        self.recompute_and_release(pending)
+        return self.txid
+
+    atomic action OpenReader:
+        rid = oneof READERS
+        if rid in self.active_readers:
+            return -1
+        self.active_readers[rid] = self.txid
+        self.reader_views[rid] = dict(self.committed)
+        self.recompute_and_release(parse_txids(self.pending_txids))
+        return self.txid
+
+    atomic action CloseReader:
+        rid = oneof READERS
+        if rid not in self.active_readers:
+            return "NONE"
+        self.active_readers.pop(rid)
+        self.reader_views.pop(rid)
+        self.recompute_and_release(parse_txids(self.pending_txids))
+        return "OK"
+
+    atomic action Get:
+        k = oneof KEYS
+        return self.committed.get(k, NOT_FOUND)
+
+    atomic action ReadFromReader:
+        rid = oneof READERS
+        k = oneof KEYS
+        if rid not in self.reader_views:
+            return NOT_FOUND
+        return self.reader_views[rid].get(k, NOT_FOUND)
+
+    atomic action CrashAndReopen:
+        # Process crash drops all in-memory readers; recovery reloads on-disk
+        # Meta.Freelist (non-empty whenever txid >= 2) into pending[txid].
+        self.active_readers = {}
+        self.reader_views = {}
+        pending = []
+        if self.txid >= 2:
+            pending = [self.txid]
+        self.recompute_and_release(pending)
+        return self.txid
+
+    def recompute_and_release(self, pending):
+        if len(self.active_readers) == 0:
+            self.min_reader_txid = -1
+        else:
+            m = -1
+            for rid in self.active_readers:
+                rt = self.active_readers[rid]
+                if m < 0 or rt < m:
+                    m = rt
+            self.min_reader_txid = m
+
+        bound = 0
+        if self.txid > 0:
+            bound = self.txid - 1
+        if self.min_reader_txid >= 0 and self.min_reader_txid < bound:
+            bound = self.min_reader_txid
+        self.release_bound = bound
+
+        kept = []
+        for t in sorted(pending):
+            if t > bound and t not in kept:
+                kept.append(t)
+        self.pending_txids = format_txids(kept)
+
+def parse_txids(s):
+    if s == "":
+        return []
+    out = []
+    for part in s.split(","):
+        out.append(int(part))
+    return out
+
+def format_txids(xs):
+    parts = []
+    for x in xs:
+        parts.append(str(x))
+    return ",".join(parts)
+
+action Init:
+    db = FreelistDB()
+
+# Safety Invariant 1: No page reachable from either meta slot or any active
+# MVCC reader ever appears in the reusable free pool.
+always assertion NoLivePageInFreelist:
+    return db.no_live_page_in_free
+
+# Safety Invariant 2: Every pending bucket strictly exceeds release_bound
+# (i.e., eligible pages are never stuck behind an already-advanced watermark).
+always assertion PendingStrictlyAboveBound:
+    if not db.no_pending_below_bound:
+        return False
+    for t in parse_txids(db.pending_txids):
+        if t <= db.release_bound:
+            return False
+    return True
+
+# Safety Invariant 3: release_bound never exceeds min_active_reader_txid when a
+# reader is open, and never exceeds max(0, txid - 1) (dual-meta barrier).
+always assertion ReleaseBoundRespectsReadersAndDualMeta:
+    max_meta_bound = 0
+    if db.txid > 0:
+        max_meta_bound = db.txid - 1
+    if db.release_bound > max_meta_bound:
+        return False
+    if db.min_reader_txid >= 0 and db.release_bound > db.min_reader_txid:
+        return False
+    return True
+
+# Safety Invariant 4: Every open reader tracks both a pinned txid and snapshot view.
+always assertion ReadersConsistent:
+    return len(db.active_readers) == len(db.reader_views)

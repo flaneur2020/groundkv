@@ -6,7 +6,7 @@ import (
 	"sort"
 )
 
-// pageAccess abstracts page reading and append-only COW page allocation for B+Tree operations.
+// pageAccess abstracts page reading, COW allocation, and replaced-page freeing for B+Tree operations.
 type pageAccess interface {
 	pageSize() int
 	maxLeafKeys() int
@@ -14,6 +14,7 @@ type pageAccess interface {
 	txid() uint64
 	readPage(pgid PageID) ([]byte, pageHeader, error)
 	allocPage(encode func(pgid PageID) ([]byte, error)) (PageID, error)
+	freePage(pgid PageID)
 }
 
 func cloneBytes(b []byte) []byte {
@@ -215,6 +216,7 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 			if err != nil {
 				return splitResult{}, err
 			}
+			pa.freePage(pgid)
 			return splitResult{leftID: newID, leftMin: cloneBytes(entries[0].key)}, nil
 		}
 
@@ -233,6 +235,7 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 		if err != nil {
 			return splitResult{}, err
 		}
+		pa.freePage(pgid)
 		return splitResult{
 			leftID:   leftID,
 			leftMin:  cloneBytes(leftEntries[0].key),
@@ -274,6 +277,7 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 			if err != nil {
 				return splitResult{}, err
 			}
+			pa.freePage(pgid)
 			return splitResult{leftID: newID, leftMin: cloneBytes(entries[0].key)}, nil
 		}
 
@@ -292,6 +296,7 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 		if err != nil {
 			return splitResult{}, err
 		}
+		pa.freePage(pgid)
 		return splitResult{
 			leftID:   leftID,
 			leftMin:  cloneBytes(leftEntries[0].key),
@@ -345,6 +350,7 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 		}
 		entries = append(entries[:idx], entries[idx+1:]...)
 		if len(entries) == 0 {
+			pa.freePage(pgid)
 			return deleteResult{newID: 0, deleted: true}, nil
 		}
 		newID, err := pa.allocPage(func(id PageID) ([]byte, error) {
@@ -353,6 +359,7 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 		if err != nil {
 			return deleteResult{}, err
 		}
+		pa.freePage(pgid)
 		return deleteResult{
 			newID:   newID,
 			newMin:  cloneBytes(entries[0].key),
@@ -383,10 +390,12 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 		}
 
 		if len(entries) == 0 {
+			pa.freePage(pgid)
 			return deleteResult{newID: 0, deleted: true}, nil
 		}
 		// Collapse single-child root branch so the tree shrinks cleanly.
 		if isRoot && len(entries) == 1 {
+			pa.freePage(pgid)
 			return deleteResult{
 				newID:   entries[0].child,
 				newMin:  cloneBytes(entries[0].key),
@@ -399,6 +408,7 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 		if err != nil {
 			return deleteResult{}, err
 		}
+		pa.freePage(pgid)
 		return deleteResult{
 			newID:   newID,
 			newMin:  cloneBytes(entries[0].key),

@@ -12,28 +12,32 @@ A BoltDB-inspired embedded key-value engine in Go built on an **append-only, cop
   - `models/kv/kv.fizz` — KV semantics, dual-meta commit protocol, MVCC snapshots, rollback, and crash recovery.
   - `models/btree/btree.fizz` — Append-only COW B+Tree page immutability, sorted scan order, and historical pinned roots.
   - `models/durability/durability.fizz` — 4-phase commit durability (`WriteDataPages` → `SyncDataPages` → `WriteMetaPage` → `SyncMetaPage`) under unsynced-drop, reordered-meta-flush, and torn-meta-write power losses.
+  - `models/freelist/freelist.fizz` — MVCC reader-aware freelist & page reclamation (`minActiveReaderTxID` + dual-meta watermark) with on-disk freelist persistence and crash recovery.
 
 ## Project Layout
 
 ```text
 groundkv/
-├── models/                    # Formal FizzBee specifications (named models/ to avoid GCC ./specs collision with -race)
-│   ├── kv/kv.fizz             # KV + Dual-Meta + MVCC + Crash Recovery spec
-│   ├── btree/btree.fizz       # Append-Only COW B+Tree immutability spec
-│   └── durability/durability.fizz # 4-phase mid-commit power-loss & write-reordering durability spec
+├── models/                        # Formal FizzBee specifications (named models/ to avoid GCC ./specs collision with -race)
+│   ├── kv/kv.fizz                 # KV + Dual-Meta + MVCC + Crash Recovery spec
+│   ├── btree/btree.fizz           # Append-Only COW B+Tree immutability spec
+│   ├── durability/durability.fizz # 4-phase mid-commit power-loss & write-reordering durability spec
+│   └── freelist/freelist.fizz     # MVCC reader-aware freelist & page reclamation spec
 ├── engine/                # Core Go storage engine
-│   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, errors
+│   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, errors
 │   ├── storage.go         # Storage interface, OSFileStorage, per-write fault-injecting MemStorage
-│   ├── page.go            # Binary page codec + CRC32 checksums
+│   ├── page.go            # Binary page codec (Meta/Branch/Leaf/Freelist) + CRC32 checksums
 │   ├── meta.go            # Dual meta page (page 0/1) atomic commit & recovery
-│   ├── btree.go           # Append-only COW B+Tree (Get, Put, Delete, Scan, Validate)
+│   ├── freelist.go        # On-disk COW freelist chain + pending/free MVCC page reclamation
+│   ├── btree.go           # COW B+Tree (Get, Put, Delete, Scan, Validate, freed-page tracking)
 │   ├── tx.go              # Read-only MVCC Tx & 4-phase single-writer COW Tx
-│   ├── db.go              # DB lifecycle, recovery, and MBT state inspection APIs
-│   └── db_test.go         # Unit, concurrency (-race), mid-commit crash, and COW property tests
+│   ├── db.go              # DB lifecycle, recovery, active reader tracking, and MBT inspection APIs
+│   └── db_test.go         # Unit, concurrency (-race), mid-commit crash, freelist, and COW tests
 ├── fizztests/             # Generated FizzBee MBT harnesses + Go adapters
 │   ├── kv/                # kv_interfaces.go, kv_test.go (generated), kv_adapters.go
 │   ├── btree/             # btree_interfaces.go, btree_test.go (generated), btree_adapters.go
-│   └── durability/        # durability_interfaces.go, durability_test.go (generated), durability_adapters.go
+│   ├── durability/        # durability_interfaces.go, durability_test.go (generated), durability_adapters.go
+│   └── freelist/          # freelist_interfaces.go, freelist_test.go (generated), freelist_adapters.go
 ├── cmd/groundkv/          # Simple CLI (put, get, del, scan, meta, verify)
 ├── docs/architecture.md   # Deep dive on disk format, COW B+Tree, and MBT design
 └── Makefile               # Spec-first verification & MBT targets
