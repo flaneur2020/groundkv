@@ -6,6 +6,8 @@ options:
 action_options:
     "Engine.BeginPut":
         max_actions: 3
+    "Engine.StageOverwrite":
+        max_actions: 1
     "Engine.BeginDelete":
         max_actions: 1
     "Engine.RollbackWrite":
@@ -14,8 +16,10 @@ action_options:
         max_actions: 1
     "Engine.CloseReader":
         max_actions: 1
+    "Disk.FailSync":
+        max_actions: 1
     "Disk.Crash":
-        max_actions: 2
+        max_actions: 1
 ---
 
 NOT_FOUND = "NOT_FOUND"
@@ -136,6 +140,17 @@ role Disk:
         txid = engine.recover_after_crash()
         return txid
 
+    # Fault 4: Survivable Sync() I/O failure on a live process — when Engine is
+    # about to fsync data or meta pages, the disk returns an I/O error, Engine
+    # aborts the write transaction (releasing the writer lock and restoring any
+    # recycled free pages) while remaining open and consistent.
+    atomic action FailSync:
+        res = engine.abort_on_sync_error()
+        if res == "SYNC_FAILED":
+            self.pending_pages = {}
+            self.has_pending_meta = False
+        return res
+
     # Read-only durable meta inspection (uncapped pure read: 0 extra states) so MBT
     # verifies BOTH on-disk durable meta slots without coupling to abstract pgid maps.
     atomic action InspectMeta:
@@ -177,6 +192,18 @@ role Engine:
         next_val = "v" + str(self.txid + 1)
         self.stage_mutation(next_val, True)
         return "OK"
+
+    # Second mutation inside an already-staged write tx: exercises read-your-own-writes
+    # and overwriting an uncommitted dirty page (delete(tx.dirty, pgid)) before commit/rollback.
+    atomic action StageOverwrite:
+        if self.phase != PHASE_STAGED:
+            return "NO_TX"
+        next_val = "w" + str(self.txid + 1)
+        self.tx_staged_val = next_val
+        if self.tx_root == 0:
+            self.tx_root = self.alloc_pgid()
+            self.tx_dirty_written = True
+        return next_val
 
     atomic action BeginDelete:
         if self.phase != PHASE_IDLE:
@@ -356,6 +383,15 @@ role Engine:
 
         self.last_acked_txid = self.txid
         return self.txid
+
+    atomic func abort_on_sync_error():
+        if self.phase != PHASE_DATA_WRITTEN and self.phase != PHASE_META_WRITTEN:
+            return "SKIP"
+        for pgid in self.tx_recycled:
+            if pgid not in self.free_pages:
+                self.free_pages.append(pgid)
+        self.clear_tx()
+        return "SYNC_FAILED"
 
 action Init:
     disk = Disk()

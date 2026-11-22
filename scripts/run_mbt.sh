@@ -67,10 +67,16 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
-echo "==> Running FizzBee MBT suite: ${SUITE_NAME} (${GO_PKG} -run ^${TEST_FUNC}$ ${GO_TEST_FLAGS:-})"
+COVER_FLAGS=""
+if [ -n "${MBT_COVER_DIR:-}" ]; then
+  mkdir -p "$MBT_COVER_DIR"
+  COVER_FLAGS="-coverpkg=./engine -coverprofile=${MBT_COVER_DIR}/mbt_${SUITE_NAME}.out"
+fi
+
+echo "==> Running FizzBee MBT suite: ${SUITE_NAME} (${GO_PKG} -run ^${TEST_FUNC}$ ${GO_TEST_FLAGS:-} ${COVER_FLAGS})"
 set +e
 # shellcheck disable=SC2086
-FIZZBEE_MBT_BIN="$MBT_RUNNER" go test ${GO_TEST_FLAGS:-} -v -count=1 -run "^${TEST_FUNC}$" "$GO_PKG"
+FIZZBEE_MBT_BIN="$MBT_RUNNER" go test ${GO_TEST_FLAGS:-} ${COVER_FLAGS} -v -count=1 -run "^${TEST_FUNC}$" "$GO_PKG"
 RC=$?
 set -e
 

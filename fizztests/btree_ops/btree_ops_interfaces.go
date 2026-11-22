@@ -11,6 +11,7 @@ import (
 
 type BTreeRole interface {
 	mbt.Role
+	ActionBulkLoad(args []mbt.Arg) (any, error)
 	ActionPut(args []mbt.Arg) (any, error)
 	ActionDelete(args []mbt.Arg) (any, error)
 	ActionGet(args []mbt.Arg) (any, error)

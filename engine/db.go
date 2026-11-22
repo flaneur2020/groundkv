@@ -361,7 +361,7 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 }
 
 // Update executes fn inside a read-write transaction, committing if fn returns nil
-// and rolling back if fn returns an error.
+// and rolling back if fn or Commit returns an error (preventing writer-lock leaks).
 func (db *DB) Update(fn func(tx *Tx) error) error {
 	tx, err := db.BeginWrite()
 	if err != nil {
@@ -371,7 +371,11 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return nil
 }
 
 // Get returns the latest committed value for key, or ErrNotFound.

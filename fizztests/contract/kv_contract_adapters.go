@@ -1,10 +1,15 @@
 // Source: ../../models/contract/kv_contract.fizz
-// Black-box contract adapter exercising GroundKV's public API with real
-// concurrent goroutines (1 Writer + 2 lock-free Readers + 1 MVCC SnapshotReader).
+// Black-box contract adapter exercising GroundKV's public API on real POSIX
+// OSFileStorage with real concurrent goroutines (1 Writer + 2 lock-free
+// Readers + 1 MVCC SnapshotReader), binary keys, near-page-size values
+// (triggering byte-capacity splits), and multi-page freelist chains.
 package contract_mbt
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -15,6 +20,52 @@ import (
 const notFoundSentinel = "NOT_FOUND"
 
 var errInvalidArg = errors.New("invalid argument from fizzbee mbt runner")
+
+// Domain mapping: maps abstract model keys/values to binary keys (including
+// NUL/0xFF bytes) and near-page-size values (80B and 120B on PageSize=256)
+// so MBT exercises byte-capacity page splits and binary key ordering!
+var (
+	keyToBytes = map[string][]byte{
+		"k1": []byte("\x00key-alpha"),
+		"k2": []byte("key-\xff-beta"),
+	}
+	bytesToKey = map[string]string{
+		"\x00key-alpha": "k1",
+		"key-\xff-beta": "k2",
+	}
+	valToBytes = map[string][]byte{
+		"v1": []byte("v1:" + strings.Repeat("A", 77)),
+		"v2": []byte("v2:" + strings.Repeat("B", 117)),
+	}
+	bytesToVal = map[string]string{
+		"v1:" + strings.Repeat("A", 77):  "v1",
+		"v2:" + strings.Repeat("B", 117): "v2",
+	}
+)
+
+func encodeKey(k string) ([]byte, error) {
+	b, ok := keyToBytes[k]
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown key %q", errInvalidArg, k)
+	}
+	return b, nil
+}
+
+func encodeVal(v string) ([]byte, error) {
+	b, ok := valToBytes[v]
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown value %q", errInvalidArg, v)
+	}
+	return b, nil
+}
+
+func decodeVal(b []byte) (string, error) {
+	v, ok := bytesToVal[string(b)]
+	if !ok {
+		return "", fmt.Errorf("unexpected decoded value length %d", len(b))
+	}
+	return v, nil
+}
 
 // WriterRoleAdapter implements the single serialized writer role.
 type WriterRoleAdapter struct {
@@ -38,7 +89,15 @@ func (a *WriterRoleAdapter) ActionPut(args []mbt.Arg) (any, error) {
 	if !ok {
 		return nil, errInvalidArg
 	}
-	if err := a.db.Put([]byte(k), []byte(v)); err != nil {
+	kb, err := encodeKey(k)
+	if err != nil {
+		return nil, err
+	}
+	vb, err := encodeVal(v)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.db.Put(kb, vb); err != nil {
 		return nil, err
 	}
 	return "OK", nil
@@ -54,7 +113,11 @@ func (a *WriterRoleAdapter) ActionDelete(args []mbt.Arg) (any, error) {
 	if !ok {
 		return nil, errInvalidArg
 	}
-	if err := a.db.Delete([]byte(k)); err != nil {
+	kb, err := encodeKey(k)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.db.Delete(kb); err != nil {
 		return nil, err
 	}
 	return "OK", nil
@@ -70,11 +133,28 @@ func (a *WriterRoleAdapter) ActionBatchSwap(args []mbt.Arg) (any, error) {
 	if !ok {
 		return nil, errInvalidArg
 	}
-	err := a.db.Update(func(tx *engine.Tx) error {
-		if err := tx.Put([]byte("k1"), []byte(v)); err != nil {
+	k1, _ := encodeKey("k1")
+	k2, _ := encodeKey("k2")
+	vb, err := encodeVal(v)
+	if err != nil {
+		return nil, err
+	}
+	tmpVal := []byte("v1:" + strings.Repeat("A", 77))
+
+	// Exercise same-tx overwrite (dirty-page replacement) + read-your-own-writes
+	// inside one atomic multi-key Update() transaction!
+	err = a.db.Update(func(tx *engine.Tx) error {
+		if err := tx.Put(k1, tmpVal); err != nil {
 			return err
 		}
-		return tx.Put([]byte("k2"), []byte(v))
+		if err := tx.Put(k1, vb); err != nil {
+			return err
+		}
+		got, err := tx.Get(k1)
+		if err != nil || string(got) != string(vb) {
+			return fmt.Errorf("read-your-own-writes mismatch in BatchSwap: got=%q err=%v", got, err)
+		}
+		return tx.Put(k2, vb)
 	})
 	if err != nil {
 		return nil, err
@@ -96,11 +176,19 @@ func (a *WriterRoleAdapter) ActionAbortedPut(args []mbt.Arg) (any, error) {
 	if !ok {
 		return nil, errInvalidArg
 	}
+	kb, err := encodeKey(k)
+	if err != nil {
+		return nil, err
+	}
+	vb, err := encodeVal(v)
+	if err != nil {
+		return nil, err
+	}
 	tx, err := a.db.BeginWrite()
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Put([]byte(k), []byte(v)); err != nil {
+	if err := tx.Put(kb, vb); err != nil {
 		_ = tx.Rollback()
 		return nil, err
 	}
@@ -125,21 +213,29 @@ func (a *ReaderRoleAdapter) ActionGet(args []mbt.Arg) (any, error) {
 	if !ok {
 		return nil, errInvalidArg
 	}
-	val, err := a.db.Get([]byte(k))
+	kb, err := encodeKey(k)
+	if err != nil {
+		return nil, err
+	}
+	val, err := a.db.Get(kb)
 	if errors.Is(err, engine.ErrNotFound) {
 		return notFoundSentinel, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return string(val), nil
+	return decodeVal(val)
 }
 
 func (a *ReaderRoleAdapter) ActionScanAll(args []mbt.Arg) (any, error) {
 	var parts []string
 	err := a.db.View(func(tx *engine.Tx) error {
 		return tx.Scan(nil, nil, func(k, v []byte) bool {
-			parts = append(parts, string(k)+"="+string(v))
+			ak, okK := bytesToKey[string(k)]
+			av, okV := bytesToVal[string(v)]
+			if okK && okV {
+				parts = append(parts, ak+"="+av)
+			}
 			return true
 		})
 	})
@@ -195,14 +291,18 @@ func (a *SnapshotReaderRoleAdapter) ActionSnapshotGet(args []mbt.Arg) (any, erro
 	if a.snap == nil {
 		return notFoundSentinel, nil
 	}
-	val, err := a.snap.Get([]byte(k))
+	kb, err := encodeKey(k)
+	if err != nil {
+		return nil, err
+	}
+	val, err := a.snap.Get(kb)
 	if errors.Is(err, engine.ErrNotFound) {
 		return notFoundSentinel, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return string(val), nil
+	return decodeVal(val)
 }
 
 func (a *SnapshotReaderRoleAdapter) ActionEndSnapshot(args []mbt.Arg) (any, error) {
@@ -220,8 +320,9 @@ func (a *SnapshotReaderRoleAdapter) ActionEndSnapshot(args []mbt.Arg) (any, erro
 }
 
 // KvContractModelAdapter wires models/contract/kv_contract.fizz as a pure
-// black-box contract (zero internal state coupling, parallel linearizability enabled).
+// black-box contract on real OSFileStorage with parallel linearizability enabled.
 type KvContractModelAdapter struct {
+	dir        string
 	db         *engine.DB
 	writer     *WriterRoleAdapter
 	reader0    *ReaderRoleAdapter
@@ -244,8 +345,6 @@ func GetTestOptions() map[string]any {
 }
 
 func (m *KvContractModelAdapter) GetState() (map[string]any, error) {
-	// Pure black-box contract: validated strictly via public API return values
-	// and concurrent linearizability.
 	return nil, mbt.ErrNotImplemented
 }
 
@@ -267,16 +366,21 @@ func (m *KvContractModelAdapter) GetRoles() (map[mbt.RoleId]mbt.Role, error) {
 }
 
 func (m *KvContractModelAdapter) Init() error {
-	st := engine.NewMemStorage()
-	opts := &engine.Options{
-		PageSize:      512,
-		MaxLeafKeys:   2,
-		MaxBranchKeys: 2,
-	}
-	db, err := engine.OpenStorage(st, opts)
+	dir, err := os.MkdirTemp("", "groundkv-contract-*")
 	if err != nil {
 		return err
 	}
+	opts := &engine.Options{
+		PageSize:       256, // Small pages + 80B/120B values trigger byte-capacity splits!
+		MaxFreelistIDs: 2,   // Force multi-page linked freelist chains
+		NoSync:         true,
+	}
+	db, err := engine.Open(filepath.Join(dir, "contract.db"), opts)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	m.dir = dir
 	m.db = db
 	m.writer = &WriterRoleAdapter{db: db}
 	m.reader0 = &ReaderRoleAdapter{db: db}
@@ -293,10 +397,14 @@ func (m *KvContractModelAdapter) Cleanup() error {
 	m.writer = nil
 	m.reader0 = nil
 	m.reader1 = nil
+	var closeErr error
 	if m.db != nil {
-		err := m.db.Close()
+		closeErr = m.db.Close()
 		m.db = nil
-		return err
 	}
-	return nil
+	if m.dir != "" {
+		_ = os.RemoveAll(m.dir)
+		m.dir = ""
+	}
+	return closeErr
 }

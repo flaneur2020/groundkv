@@ -553,3 +553,53 @@ func TestFreelistReclamationAndMVCCReaderBarrier(t *testing.T) {
 		t.Fatalf("HighWater grew unexpectedly after reopen: before=%d, after=%d", hwReopen, db2.Meta().HighWater)
 	}
 }
+
+func TestSyncFailureRecoveryAndMultiPageFreelistChain(t *testing.T) {
+	opts := &engine.Options{
+		PageSize:       512,
+		MaxLeafKeys:    2,
+		MaxBranchKeys:  2,
+		MaxFreelistIDs: 2, // Force multi-page linked freelist chains (next != 0)
+	}
+	st := engine.NewMemStorage()
+	db, err := engine.OpenStorage(st, opts)
+	if err != nil {
+		t.Fatalf("OpenStorage: %v", err)
+	}
+
+	// Build a multi-level tree and churn writes to generate multi-page freelist chains.
+	for i := 0; i < 12; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%02d", i%5)), []byte(fmt.Sprintf("v%02d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Inject a Sync() failure during Update() — must return error AND release writeTx lock!
+	st.SetFailSync(true)
+	if err := db.Put([]byte("k00"), []byte("should-fail")); err == nil {
+		t.Fatalf("expected Put to fail when Sync fails")
+	}
+	st.SetFailSync(false)
+
+	// Subsequent writes must succeed (proving db.Update rolled back and released writer lock).
+	if err := db.Put([]byte("k00"), []byte("recovered-write")); err != nil {
+		t.Fatalf("Put after Sync failure recovery failed (writer lock leaked?): %v", err)
+	}
+	if got, err := db.Get([]byte("k00")); err != nil || string(got) != "recovered-write" {
+		t.Fatalf("Get(k00) = (%q, %v), want recovered-write", got, err)
+	}
+
+	// Reopen from durable image and confirm multi-page freelist chain decodes cleanly.
+	st2 := st.SimulateCrash()
+	db2, err := engine.OpenStorage(st2, opts)
+	if err != nil {
+		t.Fatalf("Reopen multi-page freelist DB: %v", err)
+	}
+	defer db2.Close()
+	if err := db2.Validate(); err != nil {
+		t.Fatalf("Validate after reopen: %v", err)
+	}
+	if got, err := db2.Get([]byte("k00")); err != nil || string(got) != "recovered-write" {
+		t.Fatalf("reopened Get(k00) = (%q, %v), want recovered-write", got, err)
+	}
+}

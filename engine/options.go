@@ -37,6 +37,12 @@ type Options struct {
 	// before splitting. Zero means split only when byte capacity is exceeded.
 	MaxBranchKeys int
 
+	// MaxFreelistIDs optionally caps how many freed PageIDs are stored per
+	// PageFlagFreelist page before chaining to a next freelist page. Zero uses
+	// full page capacity. Setting a small cap (e.g. 2) in tests/MBT forces
+	// multi-page linked freelist chains even on small key domains.
+	MaxFreelistIDs int
+
 	// NoSync disables fsync calls on commit. Leave false for crash durability.
 	NoSync bool
 
@@ -57,7 +63,7 @@ func (o *Options) withDefaults() (Options, error) {
 	if cfg.PageSize < MinPageSize || (cfg.PageSize&(cfg.PageSize-1)) != 0 {
 		return Options{}, ErrInvalidOptions
 	}
-	if cfg.MaxLeafKeys < 0 || cfg.MaxBranchKeys < 0 {
+	if cfg.MaxLeafKeys < 0 || cfg.MaxBranchKeys < 0 || cfg.MaxFreelistIDs < 0 {
 		return Options{}, ErrInvalidOptions
 	}
 	if cfg.MaxLeafKeys == 1 || cfg.MaxBranchKeys == 1 {

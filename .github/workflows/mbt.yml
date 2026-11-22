@@ -68,5 +68,8 @@ jobs:
       - name: Model-check all FizzBee specs
         run: make FIZZ=fizz check-specs
 
-      - name: Run FizzBee Model-Based Testing (contract + -race parallel, storage_protocol, btree_ops)
-        run: make FIZZ=fizz FIZZBEE_MBT_SERVER=fizzbee-mbt-server FIZZBEE_MBT_BIN=fizzbee-mbt-runner mbt-contract mbt-storage-protocol mbt-btree-ops
+      - name: Run formal spec mutation checks
+        run: make FIZZ=fizz check-mutations
+
+      - name: Run FizzBee Model-Based Testing (-race + engine coverage)
+        run: make FIZZ=fizz FIZZBEE_MBT_SERVER=fizzbee-mbt-server FIZZBEE_MBT_BIN=fizzbee-mbt-runner mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage

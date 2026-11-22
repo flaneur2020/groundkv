@@ -239,6 +239,9 @@ func (tx *Tx) prepareFreelistPages() error {
 	}
 
 	perPage := maxFreelistIDsPerPage(tx.pageSize())
+	if tx.db.opts.MaxFreelistIDs > 0 && tx.db.opts.MaxFreelistIDs < perPage {
+		perPage = tx.db.opts.MaxFreelistIDs
+	}
 	numPages := (len(initialAll) + perPage - 1) / perPage
 
 	chainIDs := make([]PageID, numPages)

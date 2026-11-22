@@ -34,10 +34,11 @@ type sharedHarness struct {
 func newSharedHarness() (*sharedHarness, error) {
 	st := engine.NewMemStorage()
 	opts := &engine.Options{
-		PageSize:      512,
-		MaxLeafKeys:   2,
-		MaxBranchKeys: 2,
-		NoFreelist:    false, // Exercise real on-disk freelist + MVCC reclamation under crashes
+		PageSize:       512,
+		MaxLeafKeys:    2,
+		MaxBranchKeys:  2,
+		MaxFreelistIDs: 2,     // Force multi-page linked freelist chains (next != 0)
+		NoFreelist:     false, // Exercise real on-disk freelist + MVCC reclamation under crashes
 	}
 	db, err := engine.OpenStorage(st, opts)
 	if err != nil {
@@ -180,6 +181,44 @@ func (a *DiskRoleAdapter) ActionCrash(args []mbt.Arg) (any, error) {
 	return int64(a.h.db.Meta().TxID), nil
 }
 
+func (a *DiskRoleAdapter) ActionFailSync(args []mbt.Arg) (any, error) {
+	a.h.mu.Lock()
+	defer a.h.mu.Unlock()
+	if a.h.writeTx == nil {
+		return "SKIP", nil
+	}
+	phase := a.h.writeTx.CommitPhase()
+	if phase != "DATA_WRITTEN" && phase != "META_WRITTEN" {
+		return "SKIP", nil
+	}
+
+	// Inject a real Sync() I/O failure on the live process, verify Sync returns
+	// an error, then rollback cleanly and confirm the DB stays usable!
+	a.h.storage.SetFailSync(true)
+	var syncErr error
+	if phase == "DATA_WRITTEN" {
+		syncErr = a.h.writeTx.SyncDataPages()
+	} else {
+		syncErr = a.h.writeTx.SyncMetaPage()
+	}
+	a.h.storage.SetFailSync(false)
+
+	// Note: if tx had 0 dirty pages (no-op delete), SyncDataPages skips Sync();
+	// still abort cleanly if phase == DATA_WRITTEN or META_WRITTEN.
+	if phase == "META_WRITTEN" && syncErr == nil {
+		return nil, fmt.Errorf("expected SyncMetaPage to fail when SetFailSync(true)")
+	}
+	tx := a.h.writeTx
+	a.h.writeTx = nil
+	if err := tx.Rollback(); err != nil {
+		return nil, fmt.Errorf("rollback after sync failure failed: %w", err)
+	}
+	if err := a.h.verifyEngineInvariantsLocked(); err != nil {
+		return nil, err
+	}
+	return "SYNC_FAILED", nil
+}
+
 func (a *DiskRoleAdapter) ActionInspectMeta(args []mbt.Arg) (any, error) {
 	a.h.mu.Lock()
 	defer a.h.mu.Unlock()
@@ -260,6 +299,24 @@ func (a *EngineRoleAdapter) ActionBeginPut(args []mbt.Arg) (any, error) {
 	}
 	a.h.writeTx = tx
 	return "OK", nil
+}
+
+func (a *EngineRoleAdapter) ActionStageOverwrite(args []mbt.Arg) (any, error) {
+	a.h.mu.Lock()
+	defer a.h.mu.Unlock()
+	if a.h.writeTx == nil || a.h.writeTx.CommitPhase() != "STAGED" {
+		return "NO_TX", nil
+	}
+	nextVal := fmt.Sprintf("w%d", a.h.db.Meta().TxID+1)
+	if err := a.h.writeTx.Put([]byte(protocolKey), []byte(nextVal)); err != nil {
+		return nil, err
+	}
+	// Verify read-your-own-writes inside the uncommitted write tx.
+	got, err := a.h.writeTx.Get([]byte(protocolKey))
+	if err != nil || string(got) != nextVal {
+		return nil, fmt.Errorf("read-your-own-writes mismatch in StageOverwrite: got=%q want=%q err=%v", got, nextVal, err)
+	}
+	return nextVal, nil
 }
 
 func (a *EngineRoleAdapter) ActionBeginDelete(args []mbt.Arg) (any, error) {

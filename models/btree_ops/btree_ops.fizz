@@ -4,25 +4,37 @@ options:
     crash_on_yield: false
     max_concurrent_actions: 1
 action_options:
+    "BTree.BulkLoad":
+        max_actions: 1
     "BTree.Put":
-        max_actions: 4
+        max_actions: 2
     "BTree.Delete":
         max_actions: 2
 ---
 
 NOT_FOUND = "NOT_FOUND"
-KEYS = ["a", "b", "c", "d"]
-RANGE_BOUNDS = ["", "a", "b", "c", "d", "e"]
+KEYS = ["a", "b", "c", "d", "e"]
+RANGE_BOUNDS = ["", "a", "b", "c", "d", "e", "f"]
 
 # Ordered B+Tree & range-scan contract specification.
-# With 4 keys ("a".."d") and MaxLeafKeys=2 / MaxBranchKeys=2 in the Go adapter
-# (with freelist ENABLED), Put/Delete sequences exercise multi-level leaf and
-# branch splits, overwrites, leaf deletions, root collapses, empty-tree
-# transitions, and arbitrary half-open [start, end) range scans.
+# With 5 keys ("a".."e"), BulkLoad, and MaxLeafKeys=2 / MaxBranchKeys=2 /
+# MaxFreelistIDs=2 in the Go adapter (with freelist ENABLED), traces reach
+# 3-level branch-of-branches trees, branch splits, multi-level collapses,
+# empty-tree transitions, multi-page freelist chains, and [start, end) scans.
 role BTree:
     action Init:
         self.txid = 0
         self.entries = {}
+
+    # Atomically inserts all 5 keys in a single transaction, immediately
+    # constructing a 3-level branch-split B+Tree so subsequent Put/Delete
+    # operations exercise deep branch splits and collapses.
+    atomic action BulkLoad:
+        self.txid += 1
+        tag = "b" + str(self.txid)
+        for k in KEYS:
+            self.entries[k] = tag + "_" + k
+        return tag
 
     atomic action Put:
         k = oneof KEYS

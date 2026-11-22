@@ -14,6 +14,9 @@ import (
 var actionRegistry = map[string]map[string]mbt.ActionFunc{
 	"": {},
 	"BTree": {
+		"BulkLoad": func(inst any, args []mbt.Arg) (any, error) {
+			return inst.(BTreeRole).ActionBulkLoad(args)
+		},
 		"Put": func(inst any, args []mbt.Arg) (any, error) {
 			return inst.(BTreeRole).ActionPut(args)
 		},

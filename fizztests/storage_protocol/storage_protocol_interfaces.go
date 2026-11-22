@@ -12,12 +12,14 @@ import (
 type DiskRole interface {
 	mbt.Role
 	ActionCrash(args []mbt.Arg) (any, error)
+	ActionFailSync(args []mbt.Arg) (any, error)
 	ActionInspectMeta(args []mbt.Arg) (any, error)
 }
 
 type EngineRole interface {
 	mbt.Role
 	ActionBeginPut(args []mbt.Arg) (any, error)
+	ActionStageOverwrite(args []mbt.Arg) (any, error)
 	ActionBeginDelete(args []mbt.Arg) (any, error)
 	ActionCommitStep(args []mbt.Arg) (any, error)
 	ActionRollbackWrite(args []mbt.Arg) (any, error)

@@ -31,10 +31,11 @@ var (
 func newBTreeRoleAdapter() (*BTreeRoleAdapter, error) {
 	st := engine.NewMemStorage()
 	opts := &engine.Options{
-		PageSize:      512,
-		MaxLeafKeys:   2,
-		MaxBranchKeys: 2,
-		NoFreelist:    false, // Exercise splits, deletes & collapses with real freelist enabled
+		PageSize:       512,
+		MaxLeafKeys:    2,
+		MaxBranchKeys:  2,
+		MaxFreelistIDs: 2,     // Force multi-page linked freelist chains alongside 3-level B+Tree ops
+		NoFreelist:     false, // Exercise splits, deletes & collapses with real freelist enabled
 	}
 	db, err := engine.OpenStorage(st, opts)
 	if err != nil {
@@ -52,6 +53,27 @@ func (a *BTreeRoleAdapter) close() error {
 		return err
 	}
 	return nil
+}
+
+func (a *BTreeRoleAdapter) ActionBulkLoad(args []mbt.Arg) (any, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	tag := fmt.Sprintf("b%d", a.db.Meta().TxID+1)
+	err := a.db.Update(func(tx *engine.Tx) error {
+		for _, k := range []string{"a", "b", "c", "d", "e"} {
+			if err := tx.Put([]byte(k), []byte(tag+"_"+k)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := a.db.Validate(); err != nil {
+		return nil, fmt.Errorf("btree validation failed after BulkLoad: %w", err)
+	}
+	return tag, nil
 }
 
 func (a *BTreeRoleAdapter) ActionPut(args []mbt.Arg) (any, error) {

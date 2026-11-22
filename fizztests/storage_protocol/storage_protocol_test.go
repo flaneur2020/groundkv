@@ -17,6 +17,9 @@ var actionRegistry = map[string]map[string]mbt.ActionFunc{
 		"Crash": func(inst any, args []mbt.Arg) (any, error) {
 			return inst.(DiskRole).ActionCrash(args)
 		},
+		"FailSync": func(inst any, args []mbt.Arg) (any, error) {
+			return inst.(DiskRole).ActionFailSync(args)
+		},
 		"InspectMeta": func(inst any, args []mbt.Arg) (any, error) {
 			return inst.(DiskRole).ActionInspectMeta(args)
 		},
@@ -24,6 +27,9 @@ var actionRegistry = map[string]map[string]mbt.ActionFunc{
 	"Engine": {
 		"BeginPut": func(inst any, args []mbt.Arg) (any, error) {
 			return inst.(EngineRole).ActionBeginPut(args)
+		},
+		"StageOverwrite": func(inst any, args []mbt.Arg) (any, error) {
+			return inst.(EngineRole).ActionStageOverwrite(args)
 		},
 		"BeginDelete": func(inst any, args []mbt.Arg) (any, error) {
 			return inst.(EngineRole).ActionBeginDelete(args)
