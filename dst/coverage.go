@@ -26,6 +26,9 @@ const (
 	EventCrashTornMetaFallback   = "crash_torn_meta_fallback"
 	EventIOFailWrite             = "io_fail_write"
 	EventIOFailSync              = "io_fail_sync"
+	EventThreeWaySplit           = "three_way_split"
+	EventDirtyAltMetaFence       = "dirty_alt_meta_fence"
+	EventBitRotDetected          = "bit_rot_detected"
 )
 
 // AllRequiredEvents enumerates every "sometimes" scenario that a full DST swarm
@@ -47,6 +50,9 @@ var AllRequiredEvents = []string{
 	EventCrashTornMetaFallback,
 	EventIOFailWrite,
 	EventIOFailSync,
+	EventThreeWaySplit,
+	EventDirtyAltMetaFence,
+	EventBitRotDetected,
 }
 
 // CoverageTracker counts hits of critical DST scenarios.

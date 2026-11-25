@@ -7,10 +7,10 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
 - **COW B+Tree** (`engine/`): fixed-size CRC32-checksummed pages, leaf/branch splitting, root promotion & collapse, half-open `[start, end)` range scans, and structural tree validation (`db.Validate()`).
 - **Dual Meta Pages & Crash Recovery**: alternating meta pages (Page 0 and Page 1) with 4-phase `Sync`-ordered commits and automatic fallback on torn meta writes.
 - **MVCC Snapshot Isolation & Freelist Reclamation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer; freed pages are persisted as COW freelist chains and recycled strictly when `freeTxID <= min(txid-1, minActiveReaderTxID)`.
-- **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage` (`CrashDropUnsynced`, `CrashReorderedMetaOnly`, `CrashTornMetaWrite`).
+- **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with exclusive `flock` locking and parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage` (`CrashDropUnsynced`, `CrashReorderedMetaOnly`, `CrashTornMetaWrite`).
 - **First-Class FizzBee Specs & Go MBT Harnesses** (`models/`, `fizztests/`):
-  - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT (`max-parallel-runs: 200`) under Go `-race`**. Zero coupling to storage internals.
-  - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s, volatile vs. durable page/meta buffers, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, and all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`). Every safety assertion is non-tautological and mutation-tested.
+  - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT under Go `-race`** on real `OSFileStorage`. Zero coupling to storage internals.
+  - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s, volatile vs. durable page/meta buffers, realistic POSIX `FailSync` + dirty-alt-meta neutralization, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, and all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`). Every safety assertion is non-tautological and verified by 3 formal mutation proofs (`make check-mutations`).
   - `models/btree_ops/btree_ops.fizz` — **Ordered B+Tree & range-scan contract** exercising multi-level splits, deletes, root collapses, empty-tree transitions, and `[start, end)` range scans with freelist enabled.
 
 ## Project Layout
@@ -35,11 +35,13 @@ groundkv/
 │   ├── contract/          # kv_contract_{interfaces,test,adapters}.go (parallel + -race on OSFileStorage)
 │   ├── storage_protocol/  # storage_protocol_{interfaces,test,adapters}.go
 │   └── btree_ops/         # btree_ops_{interfaces,test,adapters}.go
-├── dst/                   # Deterministic Simulation Testing (DST) harness
-│   ├── simdisk.go         # Sector-level (64B) fault-injecting Storage (subset/reordered/torn crashes + R/W/Sync I/O errors)
-│   ├── coverage.go        # 16 Antithesis-style "sometimes" scenario coverage assertions
-│   ├── sim.go             # Seed-reproducible Swarm simulator, multi-reader MVCC pool & 7-invariant shadow oracle
-│   └── dst_test.go        # TestDSTSwarm, TestDSTSteadyStateReclamation, TestDSTReplay (-dst-seed=<N>)
+├── dst/                   # Deterministic Simulation Testing (DST), OS crash & linearizability harness
+│   ├── simdisk.go         # Sector-level (64B) fault-injecting Storage (subset/reordered/torn crashes, bit-rot & R/W/Sync I/O errors)
+│   ├── coverage.go        # 19 Antithesis-style "sometimes" scenario coverage assertions
+│   ├── sim.go             # Seed-reproducible 7-profile Swarm simulator, multi-reader MVCC pool & shadow oracle
+│   ├── dst_test.go        # TestDSTSwarm, TestDSTSteadyStateReclamation, TestDSTReplay (-dst-seed=<N>)
+│   ├── oscrash_test.go    # Real subprocess SIGKILL crash-recovery test on OSFileStorage + flock
+│   └── linearizability_test.go # Concurrent real-time linearizability & MVCC snapshot verifier (-race)
 ├── scripts/               # MBT runner, formal spec mutation checks & coverage merger
 ├── cmd/
 │   ├── groundkv/          # Simple CLI (put, get, del, scan, meta, verify)

@@ -19,6 +19,7 @@ var (
 	ErrCorruptedPage  = errors.New("groundkv: page checksum or format mismatch")
 	ErrWriteTxActive  = errors.New("groundkv: write transaction already active")
 	ErrInvalidOptions = errors.New("groundkv: invalid options")
+	ErrFileLocked     = errors.New("groundkv: database file is already locked")
 )
 
 // Options configures a GroundKV database instance.

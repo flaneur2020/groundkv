@@ -40,11 +40,12 @@ scaffold-interfaces:
 test:
 	go test -v ./engine/...
 
-## race: Run Go engine tests under the race detector
+## race: Run Go engine tests and concurrent linearizability stress tests under the race detector
 race:
 	go test -race -v ./engine/...
+	go test -race -v -run TestConcurrentLinearizability ./dst
 
-## dst: Run Deterministic Simulation Testing (Swarm Testing + 16 sometimes scenario coverage assertions)
+## dst: Run Deterministic Simulation Testing (7 Swarm profiles, 19 scenario coverage checks, SIGKILL crash recovery & linearizability)
 dst:
 	mkdir -p $(MBT_COVER_DIR)
 	go test -v -coverpkg=./engine -coverprofile=$(MBT_COVER_DIR)/dst.out ./dst/...

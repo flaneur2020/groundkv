@@ -156,11 +156,22 @@ func (db *DB) recover() error {
 		return fmt.Errorf("%w: meta0=(%v), meta1=(%v)", ErrCorruptedMeta, lastErr0, lastErr1)
 	}
 
+	// Verify that the active meta's root page header & checksum are intact so
+	// durable bit-rot or a violated sync barrier fails loudly on Open rather
+	// than silently rolling back an acknowledged commit.
+	if db.meta.Root != 0 {
+		if _, h, err := db.readCommittedPageLocked(db.meta.Root); err != nil {
+			return fmt.Errorf("groundkv: recover root page %d: %w", db.meta.Root, err)
+		} else if h.flags != PageFlagLeaf && h.flags != PageFlagBranch {
+			return fmt.Errorf("%w: root page %d has invalid flags %d", ErrCorruptedPage, db.meta.Root, h.flags)
+		}
+	}
+
 	// Reload on-disk freelist into pending[activeMeta.TxID] so pages that may
 	// still be referenced by the older meta slot (txid-1) are protected until
 	// the next commit rotates the older meta slot.
 	if !db.opts.NoFreelist && db.meta.Freelist != 0 {
-		freedIDs, chainPages, err := db.readFreelistChain(db.meta.Freelist)
+		freedIDs, chainPages, err := db.readFreelistChainLocked(db.meta.Freelist)
 		if err != nil {
 			return fmt.Errorf("groundkv: recover freelist: %w", err)
 		}
@@ -168,6 +179,12 @@ func (db *DB) recover() error {
 		db.freelist.addPending(db.meta.TxID, freedIDs)
 	}
 	return nil
+}
+
+func (db *DB) isClosed() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.closed
 }
 
 func (db *DB) readMetaSlot(slot PageID) (Meta, error) {
@@ -184,6 +201,15 @@ func (db *DB) readMetaSlotWithSize(slot PageID, pageSize int) (Meta, error) {
 }
 
 func (db *DB) readCommittedPage(pgid PageID) ([]byte, pageHeader, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.readCommittedPageLocked(pgid)
+}
+
+func (db *DB) readCommittedPageLocked(pgid PageID) ([]byte, pageHeader, error) {
+	if db.closed {
+		return nil, pageHeader{}, ErrDBClosed
+	}
 	buf := make([]byte, db.opts.PageSize)
 	off := int64(pgid) * int64(db.opts.PageSize)
 	n, err := db.storage.ReadAt(buf, off)
@@ -280,7 +306,7 @@ func (db *DB) ReachablePages(root PageID, freelistHead PageID) ([]PageID, error)
 		}
 	}
 	if freelistHead != 0 {
-		_, chainPages, err := db.readFreelistChain(freelistHead)
+		_, chainPages, err := db.readFreelistChainLocked(freelistHead)
 		if err != nil {
 			return nil, err
 		}
@@ -302,7 +328,7 @@ func (db *DB) collectTreePagesLocked(pgid PageID, visited map[PageID]bool) error
 		return nil
 	}
 	visited[pgid] = true
-	buf, h, err := db.readCommittedPage(pgid)
+	buf, h, err := db.readCommittedPageLocked(pgid)
 	if err != nil {
 		return err
 	}
@@ -488,7 +514,7 @@ func (db *DB) RawPage(pgid PageID) ([]byte, error) {
 	if db.closed {
 		return nil, ErrDBClosed
 	}
-	buf, _, err := db.readCommittedPage(pgid)
+	buf, _, err := db.readCommittedPageLocked(pgid)
 	return buf, err
 }
 
@@ -499,7 +525,9 @@ func (db *DB) Validate() error {
 	})
 }
 
-// Close closes the database and its underlying storage.
+// Close closes the database and its underlying storage. Any concurrent in-flight
+// committed page reads finish before Close acquires db.mu, and subsequent reads
+// on still-open read-only Tx handles cleanly return ErrDBClosed without races.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -512,5 +540,6 @@ func (db *DB) Close() error {
 		db.writeTx.dirty = nil
 		db.writeTx = nil
 	}
+	clear(db.readerCounts)
 	return db.storage.Close()
 }

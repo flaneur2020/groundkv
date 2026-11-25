@@ -86,6 +86,9 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if tx.db.isClosed() {
+		return nil, ErrDBClosed
+	}
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
 	}
@@ -105,6 +108,9 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 func (tx *Tx) Scan(start, end []byte, fn func(k, v []byte) bool) error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	if tx.db.isClosed() {
+		return ErrDBClosed
 	}
 	return btreeScan(tx, tx.meta.Root, start, end, fn)
 }
@@ -165,6 +171,9 @@ func (tx *Tx) Delete(key []byte) error {
 func (tx *Tx) Validate() error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	if tx.db.isClosed() {
+		return ErrDBClosed
 	}
 	return btreeValidate(tx, tx.meta.Root, tx.meta.HighWater)
 }
@@ -447,6 +456,14 @@ func (tx *Tx) Rollback() error {
 	}
 
 	tx.db.mu.Lock()
+	if tx.db.closed {
+		tx.db.mu.Unlock()
+		tx.dirty = nil
+		tx.freed = nil
+		tx.recycled = nil
+		tx.localFree = nil
+		return nil
+	}
 	if tx.writable {
 		if tx.phase >= txPhaseMetaWritten {
 			tx.db.dirtyAltMeta = altMetaDirty

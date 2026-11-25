@@ -25,7 +25,8 @@ type OSFileStorage struct {
 	f *os.File
 }
 
-// OpenOSFile opens or creates a database file at path.
+// OpenOSFile opens or creates a database file at path and acquires an exclusive
+// non-blocking advisory lock (flock) to prevent multi-process corruption.
 // When creating a new file, it also fsyncs the parent directory so the directory
 // entry itself survives power loss on POSIX filesystems.
 func OpenOSFile(path string) (*OSFileStorage, error) {
@@ -36,8 +37,13 @@ func OpenOSFile(path string) (*OSFileStorage, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := lockFile(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	if isNew {
 		if err := syncParentDir(path); err != nil {
+			_ = unlockFile(f)
 			_ = f.Close()
 			return nil, err
 		}
@@ -63,7 +69,11 @@ func (s *OSFileStorage) ReadAt(p []byte, off int64) (int, error)  { return s.f.R
 func (s *OSFileStorage) WriteAt(p []byte, off int64) (int, error) { return s.f.WriteAt(p, off) }
 func (s *OSFileStorage) Sync() error                              { return s.f.Sync() }
 func (s *OSFileStorage) Truncate(size int64) error                { return s.f.Truncate(size) }
-func (s *OSFileStorage) Close() error                             { return s.f.Close() }
+
+func (s *OSFileStorage) Close() error {
+	_ = unlockFile(s.f)
+	return s.f.Close()
+}
 
 func (s *OSFileStorage) Size() (int64, error) {
 	fi, err := s.f.Stat()
@@ -201,20 +211,6 @@ func (m *MemStorage) Close() error {
 	defer m.mu.Unlock()
 	m.closed = true
 	return nil
-}
-
-// PendingWrites returns the number of unsynced WriteAt calls currently buffered.
-func (m *MemStorage) PendingWrites() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.pending)
-}
-
-// SyncCount returns how many Sync calls have succeeded on this storage instance.
-func (m *MemStorage) SyncCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.syncCount
 }
 
 // CloneDurable returns a read-only snapshot MemStorage initialized solely from

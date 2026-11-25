@@ -223,6 +223,31 @@ func (d *SimDisk) CloneDurable() *SimDisk {
 	}
 }
 
+// CloneDurableWithBitRot returns a cloned durable SimDisk with a single byte
+// flipped inside each listed page ID to simulate silent storage bit-rot /
+// latent sector errors without mutating d.
+func (d *SimDisk) CloneDurableWithBitRot(pageSize int, pgids ...engine.PageID) (*SimDisk, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	img := make([]byte, len(d.durable))
+	copy(img, d.durable)
+	flipped := false
+	for _, pgid := range pgids {
+		// Flip byte at offset 16 (inside page header txid, covered by CRC32).
+		off := int(pgid)*pageSize + 16
+		if off >= 0 && off < len(img) {
+			img[off] ^= 0x5A
+			flipped = true
+		}
+	}
+	return &SimDisk{
+		rng:         d.rng,
+		faultsMuted: true,
+		working:     img,
+		durable:     append([]byte(nil), img...),
+	}, flipped
+}
+
 // PowerLoss simulates a sudden power failure on d under the specified style,
 // closing d and returning a fresh rebooted SimDisk reflecting the surviving
 // on-disk sectors.

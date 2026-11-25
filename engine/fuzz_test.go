@@ -13,7 +13,11 @@ import (
 func FuzzDecodePages(f *testing.F) {
 	const ps = 256
 
-	// Valid meta page
+	// Valid meta page (even slot 0 with even TxID 2) + parity-mismatch seed (slot 0 with odd TxID 1)
+	f.Add(encodeMetaPage(ps, 0, Meta{
+		Magic: metaMagic, Version: metaVersion, PageSize: ps,
+		Root: 2, HighWater: 4, TxID: 2, Freelist: 3,
+	}), uint64(0))
 	f.Add(encodeMetaPage(ps, 0, Meta{
 		Magic: metaMagic, Version: metaVersion, PageSize: ps,
 		Root: 2, HighWater: 4, TxID: 1, Freelist: 3,

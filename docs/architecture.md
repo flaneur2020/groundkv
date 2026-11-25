@@ -57,12 +57,13 @@ GroundKV separates **what** the public KV API guarantees (black-box contract) fr
 | `models/storage_protocol/storage_protocol.fizz` | **White-Box Protocol** (real abstract `pgid`s + volatile/durable `Disk`) | `Disk#0` + `Engine#0` — 4-phase `CommitStep`, `Put`/`Delete`/`RollbackWrite`, MVCC reader, `Disk.InspectMeta`, and `Disk.Crash(DROP\|REORDERED\|TORN)` | `AtLeastOneValidMeta`, `ValidMetaRootsMatchDurablePages`, `NoLivePageInFreelist`, `ReaderSeesIntactDurablePage`, `CommittedTxIDNeverRegresses` — verified against real `MemStorage.CloneDurable()`, `InspectMeta()`, and `ReachablePages()` with zero adapter shadow state |
 | `models/btree_ops/btree_ops.fizz` | **Data-Structure & Range Query** | `BTree#0` with `MaxLeafKeys=2`, `MaxBranchKeys=2`, and **freelist enabled** | Multi-level splits, deletes, root collapses, empty-tree transitions, and half-open `[start, end)` `ScanRange` correctness + `db.Validate()` |
 
-### 4. Verification Pyramid: FizzBee MBT + DST + Go Fuzzing
+### 4. Verification Pyramid: FizzBee MBT + DST + OS Crash/Linearizability + Go Fuzzing
 
-GroundKV combines three complementary verification layers:
-1. **FizzBee MBT (`models/`, `fizztests/`)**: Exhaustive state-space verification + parallel `-race` linearizability + formal mutation checks (`make check-mutations`).
-2. **Deterministic Simulation Testing (`dst/`)**: Single-threaded, 100% seed-reproducible Swarm Testing across 5 randomized storage profiles (`hot-churn-crash`, `wide-deep-btree`, `binary-byte-splits`, `chaos-io-faults`, `hybrid-swarm`) with 64-byte sector-level `SimDisk` power-loss faults (arbitrary sector drop/reorder/tear), probabilistic `ReadAt`/`WriteAt`/`Sync` I/O errors, multi-reader MVCC pools, exact shadow-oracle verification, and **16 mandatory "sometimes" scenario coverage assertions**.
-3. **Go Native Fuzzing (`engine/fuzz_test.go`)**: Mutation fuzzing of raw page decoders (`FuzzDecodePages`) and corrupted/cyclic/truncated full DB images (`FuzzOpenCorruptStorage`).
+GroundKV combines four complementary verification layers:
+1. **FizzBee MBT (`models/`, `fizztests/`)**: Exhaustive state-space verification (including realistic POSIX `FailSync` + dirty-alt-meta neutralization) + parallel `-race` execution + 3 formal negative-control mutation checks (`make check-mutations`).
+2. **Deterministic Simulation Testing (`dst/`)**: Single-threaded, 100% seed-reproducible Swarm Testing across 7 randomized storage profiles (`hot-churn-crash`, `wide-deep-btree`, `binary-byte-splits`, `chaos-io-faults`, `extreme-3way-splits`, `double-fault-meta-sync`, `hybrid-swarm`) with 64-byte sector-level `SimDisk` power-loss faults, silent bit-rot (LSE) verification, probabilistic `ReadAt`/`WriteAt`/`Sync` I/O errors, multi-reader MVCC pools, exact shadow-oracle verification, and **19 mandatory "sometimes" scenario coverage assertions**.
+3. **Real OS Crash & Concurrent Linearizability (`dst/oscrash_test.go`, `dst/linearizability_test.go`)**: Subprocess `SIGKILL` crash-restart cycles on real `OSFileStorage` (`flock` + `fsync`) and real-time interval linearizability checking across concurrent readers, writers, and long-lived MVCC snapshots under `-race`.
+4. **Go Native Fuzzing (`engine/fuzz_test.go`)**: Mutation fuzzing of raw page decoders (`FuzzDecodePages`) and corrupted/cyclic/truncated full DB images (`FuzzOpenCorruptStorage`).
 
 ### Evolution Roadmap
 

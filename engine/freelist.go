@@ -185,9 +185,9 @@ func decodeFreelistPage(buf []byte, h pageHeader) (next PageID, ids []PageID, er
 	return next, ids, nil
 }
 
-// readFreelistChain reads all freed PageIDs and the chain's own page IDs
-// starting from headPGID.
-func (db *DB) readFreelistChain(headPGID PageID) (freedIDs []PageID, chainPages []PageID, err error) {
+// readFreelistChainLocked reads all freed PageIDs and the chain's own page IDs
+// starting from headPGID. Caller must hold db.mu (read or write) or own db during recover.
+func (db *DB) readFreelistChainLocked(headPGID PageID) (freedIDs []PageID, chainPages []PageID, err error) {
 	if headPGID == 0 {
 		return nil, nil, nil
 	}
@@ -198,7 +198,7 @@ func (db *DB) readFreelistChain(headPGID PageID) (freedIDs []PageID, chainPages 
 			return nil, nil, fmt.Errorf("%w: cycle in freelist chain at pgid %d", ErrCorruptedPage, curr)
 		}
 		visited[curr] = true
-		buf, h, err := db.readCommittedPage(curr)
+		buf, h, err := db.readCommittedPageLocked(curr)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -19,7 +19,7 @@ src = open(spec_path).read()
 # Mutation 1: Omit disk.Sync() barrier between DATA_WRITTEN and DATA_SYNCED.
 m1_target = (
     "        if self.phase == PHASE_DATA_WRITTEN:\n"
-    "            if self.tx_dirty_written:\n"
+    "            if self.tx_dirty_written or len(self.free_pages) > 0 or len(self.pending_free) > 0:\n"
     "                disk.Sync()"
 )
 m1_replace = (
@@ -39,6 +39,15 @@ m2_replace = "        pass"
 assert m2_target in src, "Mutation 2 target snippet not found in spec"
 os.makedirs(os.path.join(out_dir, "m2"), exist_ok=True)
 open(os.path.join(out_dir, "m2", "mut2.fizz"), "w").write(src.replace(m2_target, m2_replace, 1))
+
+# Mutation 3: Omit disk.InvalidateMeta() on failed SyncMetaPage rollback.
+# Without neutralizing the dirty alternate meta slot in OS page cache, a later
+# transaction's file-wide SyncDataPages() resurrects the aborted transaction!
+m3_target = "            disk.InvalidateMeta(next_txid % 2)"
+m3_replace = "            pass"
+assert m3_target in src, "Mutation 3 target snippet not found in spec"
+os.makedirs(os.path.join(out_dir, "m3"), exist_ok=True)
+open(os.path.join(out_dir, "m3", "mut3.fizz"), "w").write(src.replace(m3_target, m3_replace, 1))
 PY
 
 check_mutation() {
@@ -58,4 +67,5 @@ check_mutation() {
 
 check_mutation "omit-data-sync-barrier" "$TMPDIR/m1/mut1.fizz" "ValidMetaRootsMatchDurablePages" "$TMPDIR/m1/out"
 check_mutation "ignore-mvcc-reader-watermark" "$TMPDIR/m2/mut2.fizz" "NoLivePageInFreelist" "$TMPDIR/m2/out"
+check_mutation "omit-alt-meta-invalidation-on-sync-fail" "$TMPDIR/m3/mut3.fizz" "NoResurrectedAbortedMeta" "$TMPDIR/m3/out"
 echo "==> All formal spec mutation checks passed!"

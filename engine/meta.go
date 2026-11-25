@@ -71,6 +71,12 @@ func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
 	if m.Magic != metaMagic || m.Version != metaVersion {
 		return Meta{}, fmt.Errorf("%w: magic/version mismatch on meta %d", ErrCorruptedMeta, slot)
 	}
+	if h.txid != m.TxID {
+		return Meta{}, fmt.Errorf("%w: header txid %d != payload txid %d on meta %d", ErrCorruptedMeta, h.txid, m.TxID, slot)
+	}
+	if m.TxID > 0 && metaSlot(m.TxID) != slot {
+		return Meta{}, fmt.Errorf("%w: meta slot %d parity mismatch for txid %d", ErrCorruptedMeta, slot, m.TxID)
+	}
 	if m.HighWater < 2 {
 		return Meta{}, fmt.Errorf("%w: invalid highWater %d on meta %d", ErrCorruptedMeta, m.HighWater, slot)
 	}

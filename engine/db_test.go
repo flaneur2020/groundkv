@@ -603,3 +603,66 @@ func TestSyncFailureRecoveryAndMultiPageFreelistChain(t *testing.T) {
 		t.Fatalf("reopened Get(k00) = (%q, %v), want recovered-write", got, err)
 	}
 }
+
+func TestFlockExclusivityAndSafeCloseWithActiveReaders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locked.db")
+
+	db1, err := engine.Open(path, &engine.Options{PageSize: 512})
+	if err != nil {
+		t.Fatalf("Open db1: %v", err)
+	}
+	if err := db1.Put([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Second concurrent open on the same path must fail with ErrFileLocked.
+	if db2, err := engine.Open(path, &engine.Options{PageSize: 512}); !errors.Is(err, engine.ErrFileLocked) {
+		if db2 != nil {
+			_ = db2.Close()
+		}
+		t.Fatalf("expected ErrFileLocked on concurrent Open, got db=%v err=%v", db2, err)
+	}
+
+	// Open an MVCC reader, close DB concurrently, and verify no race and clean ErrDBClosed.
+	rtx, err := db1.BeginRead()
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			val, getErr := rtx.Get([]byte("k1"))
+			if errors.Is(getErr, engine.ErrDBClosed) {
+				return
+			}
+			if getErr != nil || string(val) != "v1" {
+				t.Errorf("unexpected concurrent Get during Close: val=%q err=%v", val, getErr)
+				return
+			}
+		}
+	}()
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close db1: %v", err)
+	}
+	wg.Wait()
+
+	if _, err := rtx.Get([]byte("k1")); !errors.Is(err, engine.ErrDBClosed) {
+		t.Fatalf("expected ErrDBClosed on reader after DB.Close, got %v", err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("Rollback on closed DB should succeed cleanly, got %v", err)
+	}
+
+	// After Close releases flock, reopening succeeds immediately.
+	db3, err := engine.Open(path, &engine.Options{PageSize: 512})
+	if err != nil {
+		t.Fatalf("Reopen after Close failed: %v", err)
+	}
+	defer db3.Close()
+	if got, err := db3.Get([]byte("k1")); err != nil || string(got) != "v1" {
+		t.Fatalf("reopened Get(k1) = (%q, %v), want v1", got, err)
+	}
+}

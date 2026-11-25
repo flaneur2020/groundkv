@@ -21,6 +21,7 @@ type Profile struct {
 	Keys         [][]byte
 	ValMinLen    int
 	ValMaxLen    int
+	BimodalVals  bool // Alternates tiny and near-page-capacity values to trigger 3-way splits
 	MaxReaders   int
 	CrashProb    float64
 	StepwiseProb float64
@@ -32,7 +33,7 @@ type Profile struct {
 // profile from seed so each seed explores a distinct region of the design space.
 func SwarmProfile(seed int64) Profile {
 	r := rand.New(rand.NewSource(seed ^ 0x517cc1b727220a95))
-	kind := int((uint64(seed) % 5))
+	kind := int((uint64(seed) % 7))
 
 	switch kind {
 	case 0: // Hot-key churn + multi-page freelist + heavy crashes
@@ -61,7 +62,7 @@ func SwarmProfile(seed int64) Profile {
 				PageSize:       512,
 				MaxLeafKeys:    2,
 				MaxBranchKeys:  2,
-				MaxFreelistIDs: 3,
+				MaxFreelistIDs: 6,
 			},
 			Keys:         makeASCIIKeys(24),
 			ValMinLen:    4,
@@ -80,7 +81,7 @@ func SwarmProfile(seed int64) Profile {
 				PageSize:       256,
 				MaxLeafKeys:    0, // Split purely by encoded byte capacity!
 				MaxBranchKeys:  0,
-				MaxFreelistIDs: 3,
+				MaxFreelistIDs: 6,
 			},
 			Keys:         makeBinaryKeys(10),
 			ValMinLen:    40,
@@ -99,7 +100,7 @@ func SwarmProfile(seed int64) Profile {
 				PageSize:       256,
 				MaxLeafKeys:    2,
 				MaxBranchKeys:  2,
-				MaxFreelistIDs: 3,
+				MaxFreelistIDs: 4,
 			},
 			Keys:         makeASCIIKeys(8),
 			ValMinLen:    4,
@@ -111,11 +112,50 @@ func SwarmProfile(seed int64) Profile {
 			Faults:       FaultConfig{FailWriteProb: 0.08, FailSyncProb: 0.12, FailReadProb: 0.03},
 		}
 
+	case 4: // Bimodal tiny/medium/near-max values forcing greedy 3-way leaf splits on 256B pages
+		return Profile{
+			Name: "extreme-3way-splits",
+			Options: engine.Options{
+				PageSize:       256,
+				MaxLeafKeys:    0,
+				MaxBranchKeys:  0,
+				MaxFreelistIDs: 6,
+			},
+			Keys:         makeASCIIKeys(6),
+			ValMinLen:    4,
+			ValMaxLen:    195,
+			BimodalVals:  true,
+			MaxReaders:   2,
+			CrashProb:    0.06,
+			StepwiseProb: 0.15,
+			RollbackProb: 0.05,
+			Faults:       FaultConfig{FailWriteProb: 0.01, FailSyncProb: 0.02, FailReadProb: 0.01},
+		}
+
+	case 5: // High Sync + Write fault overlap exercising dirtyAltMeta fence & retry
+		return Profile{
+			Name: "double-fault-meta-sync",
+			Options: engine.Options{
+				PageSize:       256,
+				MaxLeafKeys:    2,
+				MaxBranchKeys:  2,
+				MaxFreelistIDs: 5,
+			},
+			Keys:         makeASCIIKeys(5),
+			ValMinLen:    4,
+			ValMaxLen:    24,
+			MaxReaders:   2,
+			CrashProb:    0.04,
+			StepwiseProb: 0.70,
+			RollbackProb: 0.0,
+			Faults:       FaultConfig{FailWriteProb: 0.12, FailSyncProb: 0.45, FailReadProb: 0.01},
+		}
+
 	default: // Randomized hybrid swarm profile
 		pageSizes := []int{256, 512, 1024}
 		leafCaps := []int{0, 2, 3}
 		branchCaps := []int{0, 2, 3}
-		flCaps := []int{0, 3, 4}
+		flCaps := []int{0, 6, 8}
 		return Profile{
 			Name: "hybrid-swarm",
 			Options: engine.Options{
@@ -305,11 +345,29 @@ func (s *Simulator) randKey() []byte {
 }
 
 func (s *Simulator) randVal() []byte {
-	span := s.profile.ValMaxLen - s.profile.ValMinLen + 1
-	if span < 1 {
-		span = 1
+	var n int
+	if s.profile.BimodalVals {
+		// Trimodal distribution tailored for 256B pages (232B payload, 11B entry overhead):
+		//   - medium (76..84B -> 87..95B entry): [med, tiny, med] <= 209B fits in 1 leaf!
+		//   - tiny   (4..8B   -> 15..19B entry)
+		//   - huge   (165..195B -> 176..206B entry): med + huge >= 263B > 232B, so
+		//     overwriting/inserting a huge middle key ALWAYS forces a 3-way split!
+		roll := s.rng.Intn(20)
+		switch {
+		case roll < 9:
+			n = 76 + s.rng.Intn(9)
+		case roll < 14:
+			n = 4 + s.rng.Intn(5)
+		default:
+			n = 165 + s.rng.Intn(31)
+		}
+	} else {
+		span := s.profile.ValMaxLen - s.profile.ValMinLen + 1
+		if span < 1 {
+			span = 1
+		}
+		n = s.profile.ValMinLen + s.rng.Intn(span)
 	}
-	n := s.profile.ValMinLen + s.rng.Intn(span)
 	buf := make([]byte, n)
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 	for i := range buf {
@@ -478,16 +536,25 @@ func (s *Simulator) doCommitStep() error {
 		s.record("CommitStep -> DATA_WRITTEN")
 
 	case "DATA_WRITTEN":
+		wasDirtyAlt := s.db.HasDirtyAltMeta()
 		if err := s.writeTx.SyncDataPages(); err != nil {
 			if isInjectedErr(err) {
-				s.cov.Hit(EventIOFailSync)
+				if errors.Is(err, ErrInjectedWrite) {
+					s.cov.Hit(EventIOFailWrite)
+				} else {
+					s.cov.Hit(EventIOFailSync)
+				}
 				_ = s.writeTx.Rollback()
 				s.writeTx = nil
 				s.stagedOracle = nil
-				s.record("SyncDataPages injected sync error -> rolled back")
+				s.record("SyncDataPages injected I/O error -> rolled back")
 				return nil
 			}
 			return fmt.Errorf("SyncDataPages: %w", err)
+		}
+		if wasDirtyAlt && !s.db.HasDirtyAltMeta() {
+			s.cov.Hit(EventDirtyAltMetaFence)
+			s.indeterminateState = nil
 		}
 		s.record("CommitStep -> DATA_SYNCED")
 
@@ -534,10 +601,22 @@ func (s *Simulator) doCommitStep() error {
 }
 
 func (s *Simulator) doAtomicWrite() error {
-	// Multi-key atomic Update (1..4 mutations in one Update transaction).
+	// Multi-key atomic Update (1..4 mutations in one Update transaction;
+	// use crisp 1-op writes on BimodalVals profiles so 3-way split leaf deltas are exact).
 	nOps := 1 + s.rng.Intn(4)
+	if s.profile.BimodalVals {
+		nOps = 1
+	}
 	next := cloneMap(s.committed)
 	muts := make(map[string]int)
+	wasDirtyAlt := s.db.HasDirtyAltMeta()
+
+	var leavesBefore int
+	if nOps == 1 && s.profile.BimodalVals {
+		s.disk.SetFaultsMuted(true)
+		leavesBefore = s.countLeafPages(s.db.Meta().Root)
+		s.disk.SetFaultsMuted(false)
+	}
 
 	err := s.db.Update(func(tx *engine.Tx) error {
 		for i := 0; i < nOps; i++ {
@@ -561,14 +640,29 @@ func (s *Simulator) doAtomicWrite() error {
 			} else if errors.Is(err, ErrInjectedSync) {
 				s.cov.Hit(EventIOFailSync)
 			}
-			if s.db.HasDirtyAltMeta() {
+			if !wasDirtyAlt && s.db.HasDirtyAltMeta() {
 				s.indeterminateTxID = s.db.Meta().TxID + 1
 				s.indeterminateState = next
+			} else if wasDirtyAlt && !s.db.HasDirtyAltMeta() {
+				s.cov.Hit(EventDirtyAltMetaFence)
+				s.indeterminateState = nil
 			}
 			s.record(fmt.Sprintf("AtomicUpdate(%d ops) aborted by injected I/O err: %v", nOps, err))
 			return nil
 		}
 		return fmt.Errorf("AtomicUpdate: %w", err)
+	}
+	if wasDirtyAlt && !s.db.HasDirtyAltMeta() {
+		s.cov.Hit(EventDirtyAltMetaFence)
+	}
+	if nOps == 1 && s.profile.BimodalVals && leavesBefore > 0 {
+		s.disk.SetFaultsMuted(true)
+		leavesAfter := s.countLeafPages(s.db.Meta().Root)
+		s.disk.SetFaultsMuted(false)
+		// A 2-way leaf split always adds +1 leaf; a 3-way split adds >= +2 leaves!
+		if leavesAfter-leavesBefore >= 2 {
+			s.cov.Hit(EventThreeWaySplit)
+		}
 	}
 	s.committed = next
 	s.lastSyncedTxID = s.db.Meta().TxID
@@ -581,6 +675,7 @@ func (s *Simulator) doAtomicDeleteBatch() error {
 	// Occasionally clear all keys to force root collapse & empty-tree transitions!
 	clearAll := len(s.committed) > 0 && s.rng.Intn(5) == 0
 	next := cloneMap(s.committed)
+	wasDirtyAlt := s.db.HasDirtyAltMeta()
 
 	err := s.db.Update(func(tx *engine.Tx) error {
 		if clearAll {
@@ -610,14 +705,20 @@ func (s *Simulator) doAtomicDeleteBatch() error {
 			} else if errors.Is(err, ErrInjectedSync) {
 				s.cov.Hit(EventIOFailSync)
 			}
-			if s.db.HasDirtyAltMeta() {
+			if !wasDirtyAlt && s.db.HasDirtyAltMeta() {
 				s.indeterminateTxID = s.db.Meta().TxID + 1
 				s.indeterminateState = next
+			} else if wasDirtyAlt && !s.db.HasDirtyAltMeta() {
+				s.cov.Hit(EventDirtyAltMetaFence)
+				s.indeterminateState = nil
 			}
 			s.record(fmt.Sprintf("AtomicDelete aborted by injected I/O err: %v", err))
 			return nil
 		}
 		return fmt.Errorf("AtomicDelete: %w", err)
+	}
+	if wasDirtyAlt && !s.db.HasDirtyAltMeta() {
+		s.cov.Hit(EventDirtyAltMetaFence)
 	}
 	s.committed = next
 	s.lastSyncedTxID = s.db.Meta().TxID
@@ -902,8 +1003,86 @@ func (s *Simulator) verifyInvariants() error {
 		}
 	}
 
-	// 6. Track "sometimes" scenario coverage metrics from real engine state!
+	// 6. Periodic non-destructive silent bit-rot (LSE) verification on durable image.
+	if s.step > 0 && s.step%30 == 0 {
+		if err := s.verifyBitRotDetectionLocked(); err != nil {
+			return err
+		}
+	}
+
+	// 7. Track "sometimes" scenario coverage metrics from real engine state!
 	s.observeCoverageLocked(meta, fl)
+	return nil
+}
+
+// verifyBitRotDetectionLocked clones the durable disk image, flips a bit in a
+// live page (both meta slots, active root, freelist chain, or interior leaf),
+// and asserts GroundKV always surfaces ErrCorruptedMeta/ErrCorruptedPage cleanly
+// rather than silently returning corrupted data or rolling back committed data.
+func (s *Simulator) verifyBitRotDetectionLocked() error {
+	ps := s.profile.Options.PageSize
+
+	// Case A: Corrupting both meta slots must always fail OpenStorage with ErrCorruptedMeta.
+	bothBad, ok := s.disk.CloneDurableWithBitRot(ps, 0, 1)
+	if ok {
+		if dbBad, err := engine.OpenStorage(bothBad, &s.profile.Options); err == nil {
+			_ = dbBad.Close()
+			return errors.New("BIT-ROT VIOLATION: OpenStorage succeeded when both meta slots were corrupted")
+		} else if !errors.Is(err, engine.ErrCorruptedMeta) {
+			return fmt.Errorf("BIT-ROT VIOLATION: expected ErrCorruptedMeta, got %v", err)
+		}
+		s.cov.Hit(EventBitRotDetected)
+	}
+
+	// Case B: Corrupting the durable active root page (when non-empty) must fail loudly
+	// on OpenStorage rather than silently reverting to an older meta slot.
+	durableProbe := s.disk.CloneDurable()
+	probeDB, err := engine.OpenStorage(durableProbe, &s.profile.Options)
+	if err != nil {
+		return fmt.Errorf("bit-rot probe OpenStorage: %w", err)
+	}
+	dMeta := probeDB.Meta()
+	var nonRootPages []engine.PageID
+	if dMeta.Root != 0 {
+		if pages, pErr := probeDB.ReachablePages(dMeta.Root, 0); pErr == nil {
+			for _, pid := range pages {
+				if pid != dMeta.Root {
+					nonRootPages = append(nonRootPages, pid)
+				}
+			}
+		}
+	}
+	_ = probeDB.Close()
+
+	if dMeta.Root != 0 {
+		rootBad, flipped := s.disk.CloneDurableWithBitRot(ps, dMeta.Root)
+		if flipped {
+			if dbBad, err := engine.OpenStorage(rootBad, &s.profile.Options); err == nil {
+				_ = dbBad.Close()
+				return fmt.Errorf("BIT-ROT VIOLATION: OpenStorage succeeded despite corrupt active root page %d", dMeta.Root)
+			} else if !errors.Is(err, engine.ErrCorruptedPage) {
+				return fmt.Errorf("BIT-ROT VIOLATION: expected ErrCorruptedPage on corrupt root, got %v", err)
+			}
+			s.cov.Hit(EventBitRotDetected)
+		}
+	}
+
+	// Case C: Corrupting a non-root reachable page must be caught by Validate().
+	if len(nonRootPages) > 0 {
+		victim := nonRootPages[s.step%len(nonRootPages)]
+		leafBad, flipped := s.disk.CloneDurableWithBitRot(ps, victim)
+		if flipped {
+			dbBad, err := engine.OpenStorage(leafBad, &s.profile.Options)
+			if err == nil {
+				valErr := dbBad.Validate()
+				_ = dbBad.Close()
+				if !errors.Is(valErr, engine.ErrCorruptedPage) {
+					return fmt.Errorf("BIT-ROT VIOLATION: Validate() did not catch corrupt page %d (err=%v)", victim, valErr)
+				}
+				s.cov.Hit(EventBitRotDetected)
+			}
+		}
+	}
 	return nil
 }
 
@@ -939,6 +1118,28 @@ func (s *Simulator) observeCoverageLocked(meta engine.Meta, fl engine.FreelistSn
 	if minR, ok := s.db.MinActiveReaderTxID(); ok && meta.TxID > 1 && minR < meta.TxID-1 && len(fl.PendingTxIDs) > 0 {
 		s.cov.Hit(EventReaderBlockedReclaim)
 	}
+}
+
+func (s *Simulator) countLeafPages(root engine.PageID) int {
+	if root == 0 {
+		return 0
+	}
+	pages, err := s.db.ReachablePages(root, 0)
+	if err != nil {
+		return 0
+	}
+	leaves := 0
+	for _, pid := range pages {
+		buf, err := s.db.RawPage(pid)
+		if err != nil || len(buf) < 10 {
+			continue
+		}
+		flags := uint16(buf[8]) | uint16(buf[9])<<8
+		if flags == engine.PageFlagLeaf {
+			leaves++
+		}
+	}
+	return leaves
 }
 
 func (s *Simulator) measureTreeHeight(root engine.PageID) int {

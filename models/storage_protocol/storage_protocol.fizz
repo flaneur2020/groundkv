@@ -65,8 +65,12 @@ role Disk:
         self.meta1_root = 0
         self.meta1_expected = NOT_FOUND
 
-        # Unsynced meta page write sitting in OS page cache
+        # Unsynced meta page write sitting in OS page cache.
+        # pending_meta_valid=True represents a valid WriteMeta(slot, ...);
+        # pending_meta_valid=False represents an InvalidateMeta(slot) zero-write
+        # performed by Rollback after a failed SyncMetaPage.
         self.has_pending_meta = False
+        self.pending_meta_valid = False
         self.pending_meta_slot = 0
         self.pending_meta_txid = 0
         self.pending_meta_root = 0
@@ -77,23 +81,36 @@ role Disk:
 
     atomic func WriteMeta(slot, txid, root, expected_val):
         self.has_pending_meta = True
+        self.pending_meta_valid = True
         self.pending_meta_slot = slot
         self.pending_meta_txid = txid
         self.pending_meta_root = root
         self.pending_meta_expected = expected_val
+
+    atomic func InvalidateMeta(slot):
+        self.has_pending_meta = True
+        self.pending_meta_valid = False
+        self.pending_meta_slot = slot
+        self.pending_meta_txid = 0
+        self.pending_meta_root = 0
+        self.pending_meta_expected = NOT_FOUND
 
     atomic func Sync():
         for pgid in self.pending_pages:
             self.durable_pages[pgid] = self.pending_pages[pgid]
         self.pending_pages = {}
         if self.has_pending_meta:
-            self.apply_durable_meta(
-                self.pending_meta_slot,
-                self.pending_meta_txid,
-                self.pending_meta_root,
-                self.pending_meta_expected,
-            )
+            if self.pending_meta_valid:
+                self.apply_durable_meta(
+                    self.pending_meta_slot,
+                    self.pending_meta_txid,
+                    self.pending_meta_root,
+                    self.pending_meta_expected,
+                )
+            else:
+                self.invalidate_durable_meta(self.pending_meta_slot)
             self.has_pending_meta = False
+            self.pending_meta_valid = False
 
     def apply_durable_meta(self, slot, txid, root, expected_val):
         if slot == 0:
@@ -107,48 +124,54 @@ role Disk:
             self.meta1_root = root
             self.meta1_expected = expected_val
 
+    def invalidate_durable_meta(self, slot):
+        if slot == 0:
+            self.meta0_valid = False
+            self.meta0_txid = 0
+            self.meta0_root = 0
+            self.meta0_expected = NOT_FOUND
+        else:
+            self.meta1_valid = False
+            self.meta1_txid = 0
+            self.meta1_root = 0
+            self.meta1_expected = NOT_FOUND
+
     # Power-loss fault action parameterized by crash mode (supports back-to-back crashes!).
     atomic action Crash:
         mode = oneof CRASH_MODES
         self.pending_pages = {}
         if mode == "DROP":
             self.has_pending_meta = False
+            self.pending_meta_valid = False
         elif mode == "REORDERED":
-            # Flushes unsynced meta while dropping unsynced data pages!
+            # Flushes unsynced meta (valid or invalidated) while dropping unsynced data pages!
             if self.has_pending_meta:
-                self.apply_durable_meta(
-                    self.pending_meta_slot,
-                    self.pending_meta_txid,
-                    self.pending_meta_root,
-                    self.pending_meta_expected,
-                )
+                if self.pending_meta_valid:
+                    self.apply_durable_meta(
+                        self.pending_meta_slot,
+                        self.pending_meta_txid,
+                        self.pending_meta_root,
+                        self.pending_meta_expected,
+                    )
+                else:
+                    self.invalidate_durable_meta(self.pending_meta_slot)
                 self.has_pending_meta = False
+                self.pending_meta_valid = False
         elif mode == "TORN":
             # Corrupts the target meta slot if an unsynced meta write is in flight!
             if self.has_pending_meta:
-                if self.pending_meta_slot == 0:
-                    self.meta0_valid = False
-                    self.meta0_txid = 0
-                    self.meta0_root = 0
-                    self.meta0_expected = NOT_FOUND
-                else:
-                    self.meta1_valid = False
-                    self.meta1_txid = 0
-                    self.meta1_root = 0
-                    self.meta1_expected = NOT_FOUND
+                self.invalidate_durable_meta(self.pending_meta_slot)
                 self.has_pending_meta = False
+                self.pending_meta_valid = False
         txid = engine.recover_after_crash()
         return txid
 
-    # Fault 4: Survivable Sync() I/O failure on a live process — when Engine is
-    # about to fsync data or meta pages, the disk returns an I/O error, Engine
-    # aborts the write transaction (releasing the writer lock and restoring any
-    # recycled free pages) while remaining open and consistent.
+    # Fault 4: Realistic POSIX Sync() I/O failure on a live process — fsync()
+    # returns an error WITHOUT discarding dirty OS page-cache buffers. Engine
+    # must explicitly neutralize any dirty alternate meta slot on Rollback so a
+    # later transaction's SyncDataPages() cannot resurrect the aborted commit.
     atomic action FailSync:
         res = engine.abort_on_sync_error()
-        if res == "SYNC_FAILED":
-            self.pending_pages = {}
-            self.has_pending_meta = False
         return res
 
     # Read-only durable meta inspection (uncapped pure read: 0 extra states) so MBT
@@ -253,7 +276,7 @@ role Engine:
             self.phase = PHASE_DATA_WRITTEN
             return "DATA_WRITTEN"
         if self.phase == PHASE_DATA_WRITTEN:
-            if self.tx_dirty_written:
+            if self.tx_dirty_written or len(self.free_pages) > 0 or len(self.pending_free) > 0:
                 disk.Sync()
             self.phase = PHASE_DATA_SYNCED
             return "DATA_SYNCED"
@@ -387,9 +410,22 @@ role Engine:
     atomic func abort_on_sync_error():
         if self.phase != PHASE_DATA_WRITTEN and self.phase != PHASE_META_WRITTEN:
             return "SKIP"
-        for pgid in self.tx_recycled:
-            if pgid not in self.free_pages:
-                self.free_pages.append(pgid)
+        if self.phase == PHASE_META_WRITTEN:
+            next_txid = self.txid + 1
+            disk.InvalidateMeta(next_txid % 2)
+            held = list(self.tx_recycled)
+            if self.tx_dirty_written and self.tx_root != 0 and self.tx_root not in held:
+                held.append(self.tx_root)
+            if len(held) > 0:
+                existing = list(self.pending_free.get(next_txid, []))
+                for pgid in held:
+                    if pgid not in existing:
+                        existing.append(pgid)
+                self.pending_free[next_txid] = sorted(existing)
+        else:
+            for pgid in self.tx_recycled:
+                if pgid not in self.free_pages:
+                    self.free_pages.append(pgid)
         self.clear_tx()
         return "SYNC_FAILED"
 
@@ -456,3 +492,13 @@ always assertion ReaderSeesIntactDurablePage:
 # Invariant 5: Durability — committed txid never regresses below last acknowledged commit.
 always assertion CommittedTxIDNeverRegresses:
     return engine.txid >= engine.last_acked_txid
+
+# Invariant 6: No resurrected aborted commit — a failed SyncMetaPage must never
+# leave a valid dirty meta slot that a subsequent SyncDataPages flushes to disk.
+always assertion NoResurrectedAbortedMeta:
+    max_allowed = engine.txid + 1 if engine.phase == PHASE_META_WRITTEN else engine.txid
+    if disk.meta0_valid and disk.meta0_txid > max_allowed:
+        return False
+    if disk.meta1_valid and disk.meta1_txid > max_allowed:
+        return False
+    return True

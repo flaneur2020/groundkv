@@ -11,7 +11,7 @@ import (
 var (
 	dstSeedFlag  = flag.Int64("dst-seed", 0, "Specific seed to replay in TestDSTReplay")
 	dstStepsFlag = flag.Int("dst-steps", 300, "Number of simulation steps per seed")
-	dstSeedsFlag = flag.Int("dst-seeds", 25, "Number of swarm seeds to run in TestDSTSwarm")
+	dstSeedsFlag = flag.Int("dst-seeds", 28, "Number of swarm seeds to run in TestDSTSwarm")
 )
 
 // TestDSTSwarm runs a deterministic Swarm Testing campaign across varied
