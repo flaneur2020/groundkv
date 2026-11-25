@@ -39,7 +39,7 @@ type Options struct {
 
 	// MaxFreelistIDs optionally caps how many freed PageIDs are stored per
 	// PageFlagFreelist page before chaining to a next freelist page. Zero uses
-	// full page capacity. Setting a small cap (e.g. 2) in tests/MBT forces
+	// full page capacity. Setting a small cap (e.g. 3) in tests/MBT forces
 	// multi-page linked freelist chains even on small key domains.
 	MaxFreelistIDs int
 
@@ -68,6 +68,12 @@ func (o *Options) withDefaults() (Options, error) {
 	}
 	if cfg.MaxLeafKeys == 1 || cfg.MaxBranchKeys == 1 {
 		// Splitting requires at least 2 entries to split cleanly.
+		return Options{}, ErrInvalidOptions
+	}
+	if cfg.MaxFreelistIDs > 0 && cfg.MaxFreelistIDs < 3 {
+		// A dual-meta COW freelist holds up to 2 pending chain generations
+		// simultaneously (pending[T] + current tx.freed), so convergence of
+		// chain length C requires perPage > 2 (spectral radius 2/perPage < 1).
 		return Options{}, ErrInvalidOptions
 	}
 	return cfg, nil

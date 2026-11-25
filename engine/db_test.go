@@ -559,7 +559,7 @@ func TestSyncFailureRecoveryAndMultiPageFreelistChain(t *testing.T) {
 		PageSize:       512,
 		MaxLeafKeys:    2,
 		MaxBranchKeys:  2,
-		MaxFreelistIDs: 2, // Force multi-page linked freelist chains (next != 0)
+		MaxFreelistIDs: 3, // Force multi-page linked freelist chains (next != 0)
 	}
 	st := engine.NewMemStorage()
 	db, err := engine.OpenStorage(st, opts)

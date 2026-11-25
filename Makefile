@@ -1,4 +1,4 @@
-# GroundKV — FizzBee Model-Based Testing (MBT) First-Class Workflow
+# GroundKV — FizzBee MBT, DST & Fuzzing First-Class Workflow
 
 FIZZ ?= $(HOME)/bin/fizzbee-v0.5.4-linux_x86/fizz
 FIZZBEE_MBT_SERVER ?= fizzbee-mbt-server
@@ -9,12 +9,12 @@ CONTRACT_SPEC := models/contract/kv_contract.fizz
 PROTOCOL_SPEC := models/storage_protocol/storage_protocol.fizz
 BTREE_OPS_SPEC := models/btree_ops/btree_ops.fizz
 
-.PHONY: all verify check-specs check-mutations scaffold-interfaces test race smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage build clean
+.PHONY: all verify check-specs check-mutations scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
 
 all: verify
 
-## verify: Run formal model checking, mutation checks, Go unit/race tests, and MBT adapter smoke tests
-verify: check-specs check-mutations race smoke-mbt
+## verify: Run formal model checking, mutation checks, Go unit/race tests, DST swarm, and MBT adapter smoke tests
+verify: check-specs check-mutations race dst smoke-mbt
 
 ## check-specs: Exhaustively model-check all 3 FizzBee specs and generate state graphs
 check-specs:
@@ -36,13 +36,23 @@ scaffold-interfaces:
 	$(FIZZ) mbt-scaffold --lang go --go-package btree_ops_mbt --out-dir fizztests/btree_ops $(BTREE_OPS_SPEC)
 	gofmt -w fizztests/contract fizztests/storage_protocol fizztests/btree_ops
 
-## test: Run Go unit, crash-recovery, freelist, and COW immutability tests
+## test: Run Go unit, crash-recovery, freelist, fuzz-seed, and COW immutability tests
 test:
 	go test -v ./engine/...
 
 ## race: Run Go engine tests under the race detector
 race:
 	go test -race -v ./engine/...
+
+## dst: Run Deterministic Simulation Testing (Swarm Testing + 16 sometimes scenario coverage assertions)
+dst:
+	mkdir -p $(MBT_COVER_DIR)
+	go test -v -coverpkg=./engine -coverprofile=$(MBT_COVER_DIR)/dst.out ./dst/...
+
+## fuzz: Run active Go mutation fuzzing on binary page decoders and corrupt disk images
+fuzz:
+	go test -fuzz=FuzzDecodePages -fuzztime=10s ./engine
+	go test -fuzz=FuzzOpenCorruptStorage -fuzztime=10s ./engine
 
 ## smoke-mbt: Run Go adapter smoke tests (verifies all MBT action bindings without external runner)
 smoke-mbt:
@@ -73,9 +83,22 @@ mbt-coverage:
 		$(MBT_COVER_DIR)/mbt_btree_ops.out
 	go tool cover -func=$(MBT_COVER_DIR)/mbt_merged.out
 
-## build: Build the groundkv CLI binary
+## combined-coverage: Merge MBT + DST + fuzz-seed profiles and report combined ./engine statement coverage
+combined-coverage:
+	mkdir -p $(MBT_COVER_DIR)
+	go test -coverpkg=./engine -coverprofile=$(MBT_COVER_DIR)/fuzz_seeds.out -run '^Fuzz' ./engine
+	python3 ./scripts/merge_coverage.py $(MBT_COVER_DIR)/combined.out \
+		$(MBT_COVER_DIR)/mbt_contract.out \
+		$(MBT_COVER_DIR)/mbt_storage_protocol.out \
+		$(MBT_COVER_DIR)/mbt_btree_ops.out \
+		$(MBT_COVER_DIR)/dst.out \
+		$(MBT_COVER_DIR)/fuzz_seeds.out
+	go tool cover -func=$(MBT_COVER_DIR)/combined.out
+
+## build: Build the groundkv and groundkv-dst CLI binaries
 build:
 	go build -o bin/groundkv ./cmd/groundkv
+	go build -o bin/groundkv-dst ./cmd/groundkv-dst
 
 ## clean: Remove generated model-checker artifacts, coverage files, and build outputs
 clean:

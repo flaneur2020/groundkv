@@ -37,7 +37,7 @@ func newSharedHarness() (*sharedHarness, error) {
 		PageSize:       512,
 		MaxLeafKeys:    2,
 		MaxBranchKeys:  2,
-		MaxFreelistIDs: 2,     // Force multi-page linked freelist chains (next != 0)
+		MaxFreelistIDs: 3,     // Force multi-page linked freelist chains (next != 0)
 		NoFreelist:     false, // Exercise real on-disk freelist + MVCC reclamation under crashes
 	}
 	db, err := engine.OpenStorage(st, opts)

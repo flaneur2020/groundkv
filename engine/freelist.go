@@ -93,8 +93,6 @@ func (fl *freelist) returnToFree(ids []PageID) {
 	}
 }
 
-func (fl *freelist) freeCount() int { return len(fl.free) }
-
 func (fl *freelist) freeIDs() []PageID {
 	out := make([]PageID, 0, len(fl.free))
 	for id := range fl.free {

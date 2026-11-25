@@ -338,8 +338,8 @@ func NewKvContractModel() KvContractModel {
 
 func GetTestOptions() map[string]any {
 	return map[string]any{
-		"max-seq-runs":      300,
-		"max-parallel-runs": 200, // Real concurrent goroutine linearizability testing!
+		"max-seq-runs":      150,
+		"max-parallel-runs": 100, // Real concurrent goroutine linearizability on synced OSFileStorage!
 		"max-actions":       15,
 	}
 }
@@ -372,8 +372,8 @@ func (m *KvContractModelAdapter) Init() error {
 	}
 	opts := &engine.Options{
 		PageSize:       256, // Small pages + 80B/120B values trigger byte-capacity splits!
-		MaxFreelistIDs: 2,   // Force multi-page linked freelist chains
-		NoSync:         true,
+		MaxFreelistIDs: 3,   // Force multi-page linked freelist chains
+		NoSync:         false,
 	}
 	db, err := engine.Open(filepath.Join(dir, "contract.db"), opts)
 	if err != nil {

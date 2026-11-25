@@ -42,6 +42,11 @@ type Tx struct {
 	// so Rollback can return them cleanly without leaking pages.
 	recycled []PageID
 
+	// localFree holds uncommitted page IDs allocated and then superseded within
+	// this same write transaction. They are safe to reuse immediately within the
+	// same transaction because no committed meta page or MVCC reader can see them.
+	localFree []PageID
+
 	// newFreelistPages tracks the page IDs of the newly written freelist chain.
 	newFreelistPages []PageID
 }
@@ -229,10 +234,11 @@ func (tx *Tx) prepareFreelistPages() error {
 			tx.freed[oldID] = struct{}{}
 		}
 	}
+	freeCount := len(tx.db.freelist.free)
 	initialAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
 	tx.db.mu.Unlock()
 
-	if len(initialAll) == 0 {
+	if len(initialAll)+len(tx.localFree) == 0 {
 		tx.meta.Freelist = 0
 		tx.newFreelistPages = nil
 		return nil
@@ -242,15 +248,42 @@ func (tx *Tx) prepareFreelistPages() error {
 	if tx.db.opts.MaxFreelistIDs > 0 && tx.db.opts.MaxFreelistIDs < perPage {
 		perPage = tx.db.opts.MaxFreelistIDs
 	}
-	numPages := (len(initialAll) + perPage - 1) / perPage
+
+	// Compute the exact minimal number of freelist pages C accounting for the
+	// fact that allocating C pages pops up to min(C, reusable) IDs out of
+	// tx.localFree and db.freelist.free, shrinking the remaining list to
+	// nonReusable + max(0, reusable - C):
+	//   - If C <= reusable: need perPage*C >= total - C    => C >= ceil(total / (perPage + 1))
+	//   - If C >  reusable: need perPage*C >= nonReusable  => C >= ceil(nonReusable / perPage)
+	total := len(initialAll) + len(tx.localFree)
+	nonReusable := len(initialAll) - freeCount
+	if nonReusable < 0 {
+		nonReusable = 0
+	}
+	numPages := (total + perPage) / (perPage + 1)
+	if nonReusable > 0 {
+		if minForNonReusable := (nonReusable + perPage - 1) / perPage; minForNonReusable > numPages {
+			numPages = minForNonReusable
+		}
+	}
+	if numPages < 1 {
+		numPages = 1
+	}
 
 	chainIDs := make([]PageID, numPages)
 	for i := 0; i < numPages; i++ {
 		chainIDs[i] = tx.allocPageID()
 	}
 
-	// Recompute after allocating chainIDs (popping from free only shrinks the list,
-	// so it always fits in numPages and never includes any live chainID).
+	// Any leftover tx.localFree pages that were not reused for chainIDs must be
+	// recorded in tx.freed so they are not leaked on commit.
+	for _, id := range tx.localFree {
+		tx.freed[id] = struct{}{}
+	}
+	tx.localFree = nil
+
+	// Recompute after allocating chainIDs (popping from localFree/free shrinks
+	// the list so it always fits in numPages and never includes any live chainID).
 	tx.db.mu.Lock()
 	finalAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
 	tx.db.mu.Unlock()
@@ -292,6 +325,24 @@ func (tx *Tx) SyncDataPages() error {
 	}
 	if tx.phase != txPhaseDataWritten {
 		return errors.New("groundkv: SyncDataPages called out of order")
+	}
+
+	tx.db.mu.Lock()
+	needClearAlt := tx.db.dirtyAltMeta
+	tx.db.mu.Unlock()
+	if needClearAlt {
+		// An earlier aborted tx left an uncommitted meta page in the alternate
+		// meta slot because both SyncMetaPage and rollback's invalidation write
+		// failed. Neutralize that slot BEFORE calling file-wide storage.Sync()
+		// so fsync cannot resurrect the rolled-back transaction.
+		slot := metaSlot(tx.meta.TxID + 1)
+		zeros := make([]byte, tx.db.opts.PageSize)
+		if _, err := tx.db.storage.WriteAt(zeros, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
+			return fmt.Errorf("groundkv: clear dirty alt meta %d: %w", slot, err)
+		}
+		tx.db.mu.Lock()
+		tx.db.dirtyAltMeta = false
+		tx.db.mu.Unlock()
 	}
 
 	if len(tx.dirty) > 0 && !tx.db.opts.NoSync {
@@ -366,6 +417,7 @@ func (tx *Tx) SyncMetaPage() error {
 	tx.dirty = nil
 	tx.freed = nil
 	tx.recycled = nil
+	tx.localFree = nil
 	return nil
 }
 
@@ -380,10 +432,42 @@ func (tx *Tx) Rollback() error {
 	}
 	tx.closed = true
 
+	var altMetaDirty bool
+	if tx.writable && tx.phase >= txPhaseMetaWritten {
+		// WriteMetaPage already wrote nextMeta into the alternate meta slot in
+		// the OS page cache before SyncMetaPage failed. Overwrite that slot with
+		// an invalid (zeroed) page so a subsequent transaction's file-wide
+		// SyncDataPages() fsync cannot resurrect this rolled-back transaction.
+		// The active committed slot (db.meta.TxID % 2) remains durable and untouched.
+		slot := metaSlot(tx.nextMeta.TxID)
+		zeros := make([]byte, tx.db.opts.PageSize)
+		if _, err := tx.db.storage.WriteAt(zeros, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
+			altMetaDirty = true
+		}
+	}
+
 	tx.db.mu.Lock()
 	if tx.writable {
-		if !tx.db.opts.NoFreelist && len(tx.recycled) > 0 {
-			tx.db.freelist.returnToFree(tx.recycled)
+		if tx.phase >= txPhaseMetaWritten {
+			tx.db.dirtyAltMeta = altMetaDirty
+		}
+		if !tx.db.opts.NoFreelist {
+			if tx.phase >= txPhaseMetaWritten {
+				// Advance HighWater past any pages written for nextMeta and hold
+				// all of them (both recycled and newly allocated) in
+				// pending[nextMeta.TxID] until a subsequent commit rotates past
+				// that meta slot.
+				held := append([]PageID(nil), tx.recycled...)
+				if tx.nextMeta.HighWater > tx.db.meta.HighWater {
+					for id := tx.db.meta.HighWater; id < tx.nextMeta.HighWater; id++ {
+						held = append(held, id)
+					}
+					tx.db.meta.HighWater = tx.nextMeta.HighWater
+				}
+				tx.db.freelist.addPending(tx.nextMeta.TxID, held)
+			} else if len(tx.recycled) > 0 {
+				tx.db.freelist.returnToFree(tx.recycled)
+			}
 		}
 		if tx.db.writeTx == tx {
 			tx.db.writeTx = nil
@@ -403,6 +487,7 @@ func (tx *Tx) Rollback() error {
 	tx.dirty = nil
 	tx.freed = nil
 	tx.recycled = nil
+	tx.localFree = nil
 	return nil
 }
 
@@ -436,6 +521,12 @@ func (tx *Tx) readPage(pgid PageID) ([]byte, pageHeader, error) {
 }
 
 func (tx *Tx) allocPageID() PageID {
+	if len(tx.localFree) > 0 {
+		last := len(tx.localFree) - 1
+		pgid := tx.localFree[last]
+		tx.localFree = tx.localFree[:last]
+		return pgid
+	}
 	if !tx.db.opts.NoFreelist {
 		tx.db.mu.Lock()
 		pgid, ok := tx.db.freelist.pop()
@@ -454,6 +545,9 @@ func (tx *Tx) allocPage(encode func(pgid PageID) ([]byte, error)) (PageID, error
 	pgid := tx.allocPageID()
 	buf, err := encode(pgid)
 	if err != nil {
+		if !tx.db.opts.NoFreelist {
+			tx.localFree = append(tx.localFree, pgid)
+		}
 		return 0, err
 	}
 	tx.dirty[pgid] = buf
@@ -465,8 +559,13 @@ func (tx *Tx) freePage(pgid PageID) {
 		return
 	}
 	// If pgid was allocated earlier in this same uncommitted write tx, drop its
-	// obsolete dirty buffer so we don't write dead pages to disk.
-	delete(tx.dirty, pgid)
+	// obsolete dirty buffer and recycle it immediately within this tx so
+	// multi-op transactions don't inflate pending/freelist churn.
+	if _, isLocal := tx.dirty[pgid]; isLocal {
+		delete(tx.dirty, pgid)
+		tx.localFree = append(tx.localFree, pgid)
+		return
+	}
 	if tx.freed != nil {
 		tx.freed[pgid] = struct{}{}
 	}

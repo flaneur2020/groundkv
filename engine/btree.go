@@ -23,12 +23,14 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
+const maxBTreeDepth = 64
+
 func btreeGet(pa pageAccess, root PageID, key []byte) ([]byte, bool, error) {
 	if root == 0 {
 		return nil, false, nil
 	}
 	curr := root
-	for {
+	for depth := 0; depth < maxBTreeDepth; depth++ {
 		buf, h, err := pa.readPage(curr)
 		if err != nil {
 			return nil, false, err
@@ -62,6 +64,7 @@ func btreeGet(pa pageAccess, root PageID, key []byte) ([]byte, bool, error) {
 			return nil, false, fmt.Errorf("%w: unexpected page flags %d at pgid %d", ErrCorruptedPage, h.flags, curr)
 		}
 	}
+	return nil, false, fmt.Errorf("%w: max btree depth exceeded during Get", ErrCorruptedPage)
 }
 
 // branchChildIndex returns the child index for key using BoltDB's convention:
@@ -81,11 +84,14 @@ func btreeScan(pa pageAccess, root PageID, start, end []byte, fn func(k, v []byt
 	if root == 0 {
 		return nil
 	}
-	_, err := btreeScanNode(pa, root, start, end, fn)
+	_, err := btreeScanNode(pa, root, start, end, 0, fn)
 	return err
 }
 
-func btreeScanNode(pa pageAccess, pgid PageID, start, end []byte, fn func(k, v []byte) bool) (bool, error) {
+func btreeScanNode(pa pageAccess, pgid PageID, start, end []byte, depth int, fn func(k, v []byte) bool) (bool, error) {
+	if depth >= maxBTreeDepth {
+		return false, fmt.Errorf("%w: max btree depth exceeded during Scan", ErrCorruptedPage)
+	}
 	buf, h, err := pa.readPage(pgid)
 	if err != nil {
 		return false, err
@@ -125,7 +131,7 @@ func btreeScanNode(pa pageAccess, pgid PageID, start, end []byte, fn func(k, v [
 			if len(end) > 0 && i > 0 && bytes.Compare(entries[i].key, end) >= 0 {
 				return false, nil
 			}
-			cont, err := btreeScanNode(pa, entries[i].child, start, end, fn)
+			cont, err := btreeScanNode(pa, entries[i].child, start, end, depth+1, fn)
 			if err != nil || !cont {
 				return false, err
 			}
@@ -137,12 +143,96 @@ func btreeScanNode(pa pageAccess, pgid PageID, start, end []byte, fn func(k, v [
 	}
 }
 
-type splitResult struct {
-	leftID   PageID
-	leftMin  []byte
-	rightID  PageID
-	splitKey []byte
-	didSplit bool
+func splitLeafEntries(entries []leafEntry, pageSize, maxKeys int) [][]leafEntry {
+	bestMid := -1
+	bestMaxBytes := pageSize + 1
+	for mid := 1; mid < len(entries); mid++ {
+		if maxKeys > 0 && (mid > maxKeys || len(entries)-mid > maxKeys) {
+			continue
+		}
+		leftSize := leafEncodedSize(entries[:mid])
+		rightSize := leafEncodedSize(entries[mid:])
+		if leftSize <= pageSize && rightSize <= pageSize {
+			m := leftSize
+			if rightSize > m {
+				m = rightSize
+			}
+			if m < bestMaxBytes {
+				bestMaxBytes = m
+				bestMid = mid
+			}
+		}
+	}
+	if bestMid != -1 {
+		return [][]leafEntry{entries[:bestMid], entries[bestMid:]}
+	}
+
+	var chunks [][]leafEntry
+	start := 0
+	for start < len(entries) {
+		end := start + 1
+		size := pageHeaderSize + leafEntryHeaderSize + len(entries[start].key) + len(entries[start].value)
+		for end < len(entries) {
+			if maxKeys > 0 && end-start >= maxKeys {
+				break
+			}
+			next := leafEntryHeaderSize + len(entries[end].key) + len(entries[end].value)
+			if size+next > pageSize {
+				break
+			}
+			size += next
+			end++
+		}
+		chunks = append(chunks, entries[start:end])
+		start = end
+	}
+	return chunks
+}
+
+func splitBranchEntries(entries []branchEntry, pageSize, maxKeys int) [][]branchEntry {
+	bestMid := -1
+	bestMaxBytes := pageSize + 1
+	for mid := 1; mid < len(entries); mid++ {
+		if maxKeys > 0 && (mid > maxKeys || len(entries)-mid > maxKeys) {
+			continue
+		}
+		leftSize := branchEncodedSize(entries[:mid])
+		rightSize := branchEncodedSize(entries[mid:])
+		if leftSize <= pageSize && rightSize <= pageSize {
+			m := leftSize
+			if rightSize > m {
+				m = rightSize
+			}
+			if m < bestMaxBytes {
+				bestMaxBytes = m
+				bestMid = mid
+			}
+		}
+	}
+	if bestMid != -1 {
+		return [][]branchEntry{entries[:bestMid], entries[bestMid:]}
+	}
+
+	var chunks [][]branchEntry
+	start := 0
+	for start < len(entries) {
+		end := start + 1
+		size := pageHeaderSize + branchEntryHeaderSize + len(entries[start].key)
+		for end < len(entries) {
+			if maxKeys > 0 && end-start >= maxKeys {
+				break
+			}
+			next := branchEntryHeaderSize + len(entries[end].key)
+			if size+next > pageSize {
+				break
+			}
+			size += next
+			end++
+		}
+		chunks = append(chunks, entries[start:end])
+		start = end
+	}
+	return chunks
 }
 
 func btreePut(pa pageAccess, root PageID, key, value []byte) (PageID, error) {
@@ -163,35 +253,47 @@ func btreePut(pa pageAccess, root PageID, key, value []byte) (PageID, error) {
 		})
 	}
 
-	res, err := btreePutNode(pa, root, key, value)
+	results, err := btreePutNode(pa, root, key, value, 0)
 	if err != nil {
 		return 0, err
 	}
-	if !res.didSplit {
-		return res.leftID, nil
+	for len(results) > 1 {
+		if branchEncodedSize(results) <= pa.pageSize() && (pa.maxBranchKeys() == 0 || len(results) <= pa.maxBranchKeys()) {
+			return pa.allocPage(func(pgid PageID) ([]byte, error) {
+				return encodeBranchPage(pa.pageSize(), pgid, pa.txid(), results)
+			})
+		}
+		chunks := splitBranchEntries(results, pa.pageSize(), pa.maxBranchKeys())
+		nextLevel := make([]branchEntry, 0, len(chunks))
+		for _, chunk := range chunks {
+			c := chunk
+			id, err := pa.allocPage(func(pgid PageID) ([]byte, error) {
+				return encodeBranchPage(pa.pageSize(), pgid, pa.txid(), c)
+			})
+			if err != nil {
+				return 0, err
+			}
+			nextLevel = append(nextLevel, branchEntry{key: cloneBytes(c[0].key), child: id})
+		}
+		results = nextLevel
 	}
-
-	// Root split: allocate a new root branch pointing to left and right subtrees.
-	rootEntries := []branchEntry{
-		{key: cloneBytes(res.leftMin), child: res.leftID},
-		{key: cloneBytes(res.splitKey), child: res.rightID},
-	}
-	return pa.allocPage(func(pgid PageID) ([]byte, error) {
-		return encodeBranchPage(pa.pageSize(), pgid, pa.txid(), rootEntries)
-	})
+	return results[0].child, nil
 }
 
-func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, error) {
+func btreePutNode(pa pageAccess, pgid PageID, key, value []byte, depth int) ([]branchEntry, error) {
+	if depth >= maxBTreeDepth {
+		return nil, fmt.Errorf("%w: max btree depth exceeded during Put", ErrCorruptedPage)
+	}
 	buf, h, err := pa.readPage(pgid)
 	if err != nil {
-		return splitResult{}, err
+		return nil, err
 	}
 
 	switch h.flags {
 	case PageFlagLeaf:
 		entries, err := decodeLeafPage(buf, h)
 		if err != nil {
-			return splitResult{}, err
+			return nil, err
 		}
 		idx := sort.Search(len(entries), func(i int) bool {
 			return bytes.Compare(entries[i].key, key) >= 0
@@ -214,55 +316,49 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 				return encodeLeafPage(pa.pageSize(), id, pa.txid(), entries)
 			})
 			if err != nil {
-				return splitResult{}, err
+				return nil, err
 			}
 			pa.freePage(pgid)
-			return splitResult{leftID: newID, leftMin: cloneBytes(entries[0].key)}, nil
+			return []branchEntry{{key: cloneBytes(entries[0].key), child: newID}}, nil
 		}
 
-		mid := len(entries) / 2
-		leftEntries := entries[:mid]
-		rightEntries := entries[mid:]
-		leftID, err := pa.allocPage(func(id PageID) ([]byte, error) {
-			return encodeLeafPage(pa.pageSize(), id, pa.txid(), leftEntries)
-		})
-		if err != nil {
-			return splitResult{}, err
-		}
-		rightID, err := pa.allocPage(func(id PageID) ([]byte, error) {
-			return encodeLeafPage(pa.pageSize(), id, pa.txid(), rightEntries)
-		})
-		if err != nil {
-			return splitResult{}, err
+		chunks := splitLeafEntries(entries, pa.pageSize(), pa.maxLeafKeys())
+		out := make([]branchEntry, 0, len(chunks))
+		for _, chunk := range chunks {
+			c := chunk
+			id, err := pa.allocPage(func(pgid PageID) ([]byte, error) {
+				return encodeLeafPage(pa.pageSize(), pgid, pa.txid(), c)
+			})
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, branchEntry{key: cloneBytes(c[0].key), child: id})
 		}
 		pa.freePage(pgid)
-		return splitResult{
-			leftID:   leftID,
-			leftMin:  cloneBytes(leftEntries[0].key),
-			rightID:  rightID,
-			splitKey: cloneBytes(rightEntries[0].key),
-			didSplit: true,
-		}, nil
+		return out, nil
 
 	case PageFlagBranch:
 		entries, err := decodeBranchPage(buf, h)
 		if err != nil {
-			return splitResult{}, err
+			return nil, err
 		}
 		idx := branchChildIndex(entries, key)
-		childRes, err := btreePutNode(pa, entries[idx].child, key, value)
+		childResults, err := btreePutNode(pa, entries[idx].child, key, value, depth+1)
 		if err != nil {
-			return splitResult{}, err
+			return nil, err
 		}
 
-		entries[idx].child = childRes.leftID
-		if len(childRes.leftMin) > 0 {
-			entries[idx].key = cloneBytes(childRes.leftMin)
-		}
-		if childRes.didSplit {
-			entries = append(entries, branchEntry{})
-			copy(entries[idx+2:], entries[idx+1:])
-			entries[idx+1] = branchEntry{key: cloneBytes(childRes.splitKey), child: childRes.rightID}
+		if len(childResults) == 1 {
+			entries[idx].child = childResults[0].child
+			if len(childResults[0].key) > 0 {
+				entries[idx].key = cloneBytes(childResults[0].key)
+			}
+		} else {
+			updated := make([]branchEntry, 0, len(entries)-1+len(childResults))
+			updated = append(updated, entries[:idx]...)
+			updated = append(updated, childResults...)
+			updated = append(updated, entries[idx+1:]...)
+			entries = updated
 		}
 
 		needSplit := branchEncodedSize(entries) > pa.pageSize()
@@ -275,38 +371,29 @@ func btreePutNode(pa pageAccess, pgid PageID, key, value []byte) (splitResult, e
 				return encodeBranchPage(pa.pageSize(), id, pa.txid(), entries)
 			})
 			if err != nil {
-				return splitResult{}, err
+				return nil, err
 			}
 			pa.freePage(pgid)
-			return splitResult{leftID: newID, leftMin: cloneBytes(entries[0].key)}, nil
+			return []branchEntry{{key: cloneBytes(entries[0].key), child: newID}}, nil
 		}
 
-		mid := len(entries) / 2
-		leftEntries := entries[:mid]
-		rightEntries := entries[mid:]
-		leftID, err := pa.allocPage(func(id PageID) ([]byte, error) {
-			return encodeBranchPage(pa.pageSize(), id, pa.txid(), leftEntries)
-		})
-		if err != nil {
-			return splitResult{}, err
-		}
-		rightID, err := pa.allocPage(func(id PageID) ([]byte, error) {
-			return encodeBranchPage(pa.pageSize(), id, pa.txid(), rightEntries)
-		})
-		if err != nil {
-			return splitResult{}, err
+		chunks := splitBranchEntries(entries, pa.pageSize(), pa.maxBranchKeys())
+		out := make([]branchEntry, 0, len(chunks))
+		for _, chunk := range chunks {
+			c := chunk
+			id, err := pa.allocPage(func(pgid PageID) ([]byte, error) {
+				return encodeBranchPage(pa.pageSize(), pgid, pa.txid(), c)
+			})
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, branchEntry{key: cloneBytes(c[0].key), child: id})
 		}
 		pa.freePage(pgid)
-		return splitResult{
-			leftID:   leftID,
-			leftMin:  cloneBytes(leftEntries[0].key),
-			rightID:  rightID,
-			splitKey: cloneBytes(rightEntries[0].key),
-			didSplit: true,
-		}, nil
+		return out, nil
 
 	default:
-		return splitResult{}, fmt.Errorf("%w: unexpected page flags %d at pgid %d", ErrCorruptedPage, h.flags, pgid)
+		return nil, fmt.Errorf("%w: unexpected page flags %d at pgid %d", ErrCorruptedPage, h.flags, pgid)
 	}
 }
 
@@ -323,14 +410,17 @@ func btreeDelete(pa pageAccess, root PageID, key []byte) (PageID, bool, error) {
 	if root == 0 {
 		return 0, false, nil
 	}
-	res, err := btreeDeleteNode(pa, root, key, true)
+	res, err := btreeDeleteNode(pa, root, key, true, 0)
 	if err != nil {
 		return 0, false, err
 	}
 	return res.newID, res.deleted, nil
 }
 
-func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (deleteResult, error) {
+func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool, depth int) (deleteResult, error) {
+	if depth >= maxBTreeDepth {
+		return deleteResult{}, fmt.Errorf("%w: max btree depth exceeded during Delete", ErrCorruptedPage)
+	}
 	buf, h, err := pa.readPage(pgid)
 	if err != nil {
 		return deleteResult{}, err
@@ -372,7 +462,7 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 			return deleteResult{}, err
 		}
 		idx := branchChildIndex(entries, key)
-		childRes, err := btreeDeleteNode(pa, entries[idx].child, key, false)
+		childRes, err := btreeDeleteNode(pa, entries[idx].child, key, false, depth+1)
 		if err != nil {
 			return deleteResult{}, err
 		}
@@ -385,7 +475,10 @@ func btreeDeleteNode(pa pageAccess, pgid PageID, key []byte, isRoot bool) (delet
 		} else {
 			entries[idx].child = childRes.newID
 			if len(childRes.newMin) > 0 {
-				entries[idx].key = cloneBytes(childRes.newMin)
+				if len(childRes.newMin) <= len(entries[idx].key) ||
+					branchEncodedSize(entries)-len(entries[idx].key)+len(childRes.newMin) <= pa.pageSize() {
+					entries[idx].key = cloneBytes(childRes.newMin)
+				}
 			}
 		}
 

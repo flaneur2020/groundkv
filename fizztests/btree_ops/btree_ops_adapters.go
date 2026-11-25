@@ -34,7 +34,7 @@ func newBTreeRoleAdapter() (*BTreeRoleAdapter, error) {
 		PageSize:       512,
 		MaxLeafKeys:    2,
 		MaxBranchKeys:  2,
-		MaxFreelistIDs: 2,     // Force multi-page linked freelist chains alongside 3-level B+Tree ops
+		MaxFreelistIDs: 3,     // Force multi-page linked freelist chains alongside 3-level B+Tree ops
 		NoFreelist:     false, // Exercise splits, deletes & collapses with real freelist enabled
 	}
 	db, err := engine.OpenStorage(st, opts)
@@ -173,6 +173,32 @@ func (a *BTreeRoleAdapter) GetState() (map[string]any, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	meta := a.db.Meta()
+
+	// Walk multi-level branch & freelist pages via ReachablePages and verify
+	// zero overlap with freelist.free on 3-level B+Tree structures.
+	livePages := make(map[engine.PageID]bool)
+	slot0, slot1, err := a.db.InspectMeta()
+	if err != nil {
+		return nil, err
+	}
+	for _, slot := range []engine.MetaSlot{slot0, slot1} {
+		if !slot.Valid {
+			continue
+		}
+		pages, err := a.db.ReachablePages(slot.Meta.Root, slot.Meta.Freelist)
+		if err != nil {
+			return nil, fmt.Errorf("ReachablePages(txid=%d): %w", slot.Meta.TxID, err)
+		}
+		for _, id := range pages {
+			livePages[id] = true
+		}
+	}
+	for _, freeID := range a.db.FreelistState().FreeIDs {
+		if livePages[freeID] {
+			return nil, fmt.Errorf("freelist violation on multi-level tree: live page %d in freelist.free", freeID)
+		}
+	}
+
 	all, err := a.db.ReadTreeAtRoot(meta.Root)
 	if err != nil {
 		return nil, err

@@ -18,7 +18,17 @@ type DB struct {
 	readerCounts  map[uint64]int
 	freelist      *freelist
 	freelistPages []PageID
+	dirtyAltMeta  bool
 	closed        bool
+}
+
+// HasDirtyAltMeta reports whether an aborted commit left an un-neutralized meta
+// page in the alternate meta slot because both SyncMetaPage and the rollback
+// invalidation write failed with I/O errors.
+func (db *DB) HasDirtyAltMeta() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.dirtyAltMeta
 }
 
 // Open opens or initializes a GroundKV database backed by a file at path.

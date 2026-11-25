@@ -32,11 +32,18 @@ groundkv/
 │   ├── db.go              # DB lifecycle, recovery, active reader tracking, and MBT inspection APIs
 │   └── db_test.go         # Unit, concurrency (-race), mid-commit crash, freelist, and COW tests
 ├── fizztests/             # Generated FizzBee MBT harnesses + zero-shadow-state Go adapters
-│   ├── contract/          # kv_contract_{interfaces,test,adapters}.go (parallel + -race)
+│   ├── contract/          # kv_contract_{interfaces,test,adapters}.go (parallel + -race on OSFileStorage)
 │   ├── storage_protocol/  # storage_protocol_{interfaces,test,adapters}.go
 │   └── btree_ops/         # btree_ops_{interfaces,test,adapters}.go
-├── scripts/run_mbt.sh     # Manages fizzbee-mbt-server + fizzbee-mbt-runner lifecycle
-├── cmd/groundkv/          # Simple CLI (put, get, del, scan, meta, verify)
+├── dst/                   # Deterministic Simulation Testing (DST) harness
+│   ├── simdisk.go         # Sector-level (64B) fault-injecting Storage (subset/reordered/torn crashes + R/W/Sync I/O errors)
+│   ├── coverage.go        # 16 Antithesis-style "sometimes" scenario coverage assertions
+│   ├── sim.go             # Seed-reproducible Swarm simulator, multi-reader MVCC pool & 7-invariant shadow oracle
+│   └── dst_test.go        # TestDSTSwarm, TestDSTSteadyStateReclamation, TestDSTReplay (-dst-seed=<N>)
+├── scripts/               # MBT runner, formal spec mutation checks & coverage merger
+├── cmd/
+│   ├── groundkv/          # Simple CLI (put, get, del, scan, meta, verify)
+│   └── groundkv-dst/      # Standalone DST swarm runner (-seed, -seeds, -steps)
 ├── docs/architecture.md   # Deep dive on disk format, COW B+Tree, freelist, and MBT design
 └── Makefile               # Spec-first verification & MBT targets
 ```
