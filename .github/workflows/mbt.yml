@@ -59,22 +59,34 @@ jobs:
           echo "$TOOLS_DIR/fizzbee-v${FIZZBEE_VERSION}-linux_x86" >> "$GITHUB_PATH"
           echo "$TOOLS_DIR/fizzbee-mbt-${FIZZBEE_MBT_VERSION}-linux_x86" >> "$GITHUB_PATH"
 
+      - name: Cache TLA+ tools (tla2tools + CommunityModules)
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/tla-tools
+          key: tla-tools-1.8.0-community-v1
+
       - name: Go vet
         run: go vet ./...
 
       - name: Engine unit, crash-recovery, fuzz-seed & race tests
         run: make race
 
-      - name: Deterministic Simulation Testing (DST swarm + 16 scenario coverage checks)
+      - name: Deterministic Simulation Testing (7 Swarm profiles, 19 scenario checks & SIGKILL crash recovery)
         run: make dst
+
+      - name: Go-side engine code mutation proofs
+        run: make check-code-mutations
+
+      - name: TLA+ protocol model checking & Formal Trace Validation on real Go DST traces
+        run: make trace-validate
 
       - name: Active Go Fuzzing (page decoders & corrupt storage images)
         run: make fuzz
 
-      - name: Model-check all FizzBee specs
+      - name: Model-check all FizzBee specs (safety & liveness)
         run: make FIZZ=fizz check-specs
 
-      - name: Run formal spec mutation checks
+      - name: Run formal spec mutation checks (4 safety + 1 liveness)
         run: make FIZZ=fizz check-mutations
 
       - name: Run FizzBee Model-Based Testing (-race + MBT & combined coverage)

@@ -915,6 +915,12 @@ func (s *Simulator) doCrash() error {
 	return nil
 }
 
+func (s *Simulator) probeOptions() *engine.Options {
+	cp := s.profile.Options
+	cp.Tracer = nil
+	return &cp
+}
+
 func (s *Simulator) verifyInvariants() error {
 	s.disk.SetFaultsMuted(true)
 	defer s.disk.SetFaultsMuted(false)
@@ -939,7 +945,7 @@ func (s *Simulator) verifyInvariants() error {
 
 	// 3. Durable disk image MUST always open and validate cleanly (even mid-commit!).
 	durableDisk := s.disk.CloneDurable()
-	durableDB, err := engine.OpenStorage(durableDisk, &s.profile.Options)
+	durableDB, err := engine.OpenStorage(durableDisk, s.probeOptions())
 	if err != nil {
 		return fmt.Errorf("durable image OpenStorage failed: %w", err)
 	}
@@ -1025,7 +1031,7 @@ func (s *Simulator) verifyBitRotDetectionLocked() error {
 	// Case A: Corrupting both meta slots must always fail OpenStorage with ErrCorruptedMeta.
 	bothBad, ok := s.disk.CloneDurableWithBitRot(ps, 0, 1)
 	if ok {
-		if dbBad, err := engine.OpenStorage(bothBad, &s.profile.Options); err == nil {
+		if dbBad, err := engine.OpenStorage(bothBad, s.probeOptions()); err == nil {
 			_ = dbBad.Close()
 			return errors.New("BIT-ROT VIOLATION: OpenStorage succeeded when both meta slots were corrupted")
 		} else if !errors.Is(err, engine.ErrCorruptedMeta) {
@@ -1037,7 +1043,7 @@ func (s *Simulator) verifyBitRotDetectionLocked() error {
 	// Case B: Corrupting the durable active root page (when non-empty) must fail loudly
 	// on OpenStorage rather than silently reverting to an older meta slot.
 	durableProbe := s.disk.CloneDurable()
-	probeDB, err := engine.OpenStorage(durableProbe, &s.profile.Options)
+	probeDB, err := engine.OpenStorage(durableProbe, s.probeOptions())
 	if err != nil {
 		return fmt.Errorf("bit-rot probe OpenStorage: %w", err)
 	}
@@ -1057,7 +1063,7 @@ func (s *Simulator) verifyBitRotDetectionLocked() error {
 	if dMeta.Root != 0 {
 		rootBad, flipped := s.disk.CloneDurableWithBitRot(ps, dMeta.Root)
 		if flipped {
-			if dbBad, err := engine.OpenStorage(rootBad, &s.profile.Options); err == nil {
+			if dbBad, err := engine.OpenStorage(rootBad, s.probeOptions()); err == nil {
 				_ = dbBad.Close()
 				return fmt.Errorf("BIT-ROT VIOLATION: OpenStorage succeeded despite corrupt active root page %d", dMeta.Root)
 			} else if !errors.Is(err, engine.ErrCorruptedPage) {
@@ -1072,7 +1078,7 @@ func (s *Simulator) verifyBitRotDetectionLocked() error {
 		victim := nonRootPages[s.step%len(nonRootPages)]
 		leafBad, flipped := s.disk.CloneDurableWithBitRot(ps, victim)
 		if flipped {
-			dbBad, err := engine.OpenStorage(leafBad, &s.profile.Options)
+			dbBad, err := engine.OpenStorage(leafBad, s.probeOptions())
 			if err == nil {
 				valErr := dbBad.Validate()
 				_ = dbBad.Close()

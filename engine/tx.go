@@ -232,6 +232,11 @@ func (tx *Tx) WriteDataPages() error {
 		}
 	}
 	tx.phase = txPhaseDataWritten
+	if tx.db.opts.Tracer != nil {
+		tx.db.mu.RLock()
+		tx.db.emitTraceLocked("WriteDataPages")
+		tx.db.mu.RUnlock()
+	}
 	return nil
 }
 
@@ -360,6 +365,11 @@ func (tx *Tx) SyncDataPages() error {
 		}
 	}
 	tx.phase = txPhaseDataSynced
+	if tx.db.opts.Tracer != nil {
+		tx.db.mu.RLock()
+		tx.db.emitTraceLocked("SyncDataPages")
+		tx.db.mu.RUnlock()
+	}
 	return nil
 }
 
@@ -385,6 +395,11 @@ func (tx *Tx) WriteMetaPage() error {
 	}
 	tx.nextMeta = nextMeta
 	tx.phase = txPhaseMetaWritten
+	if tx.db.opts.Tracer != nil {
+		tx.db.mu.RLock()
+		tx.db.emitTraceLocked("WriteMetaPage")
+		tx.db.mu.RUnlock()
+	}
 	return nil
 }
 
@@ -420,6 +435,7 @@ func (tx *Tx) SyncMetaPage() error {
 		tx.db.freelist.release(tx.db.releaseBoundLocked())
 	}
 	tx.db.writeTx = nil
+	tx.db.emitTraceLocked("SyncMetaPage")
 	tx.db.mu.Unlock()
 
 	tx.closed = true
@@ -489,6 +505,7 @@ func (tx *Tx) Rollback() error {
 		if tx.db.writeTx == tx {
 			tx.db.writeTx = nil
 		}
+		tx.db.emitTraceLocked("RollbackWrite")
 	} else {
 		if c := tx.db.readerCounts[tx.meta.TxID]; c <= 1 {
 			delete(tx.db.readerCounts, tx.meta.TxID)
@@ -498,6 +515,7 @@ func (tx *Tx) Rollback() error {
 		if !tx.db.opts.NoFreelist {
 			tx.db.freelist.release(tx.db.releaseBoundLocked())
 		}
+		tx.db.emitTraceLocked("CloseRead")
 	}
 	tx.db.mu.Unlock()
 

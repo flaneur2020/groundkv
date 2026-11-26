@@ -14,8 +14,6 @@ action_options:
         max_actions: 1
     "SnapshotReader.BeginSnapshot":
         max_actions: 1
-    "SnapshotReader.EndSnapshot":
-        max_actions: 1
 ---
 
 NOT_FOUND = "NOT_FOUND"
@@ -92,7 +90,7 @@ role SnapshotReader:
             return NOT_FOUND
         return self.snap.get(k, NOT_FOUND)
 
-    atomic action EndSnapshot:
+    atomic fair action EndSnapshot:
         if not self.active:
             return "NONE"
         self.active = False
@@ -116,3 +114,7 @@ always assertion SnapshotCleanWhenClosed:
     if not snap_reader.active:
         return len(snap_reader.snap) == 0
     return True
+
+# Liveness: every opened MVCC snapshot eventually closes under fair EndSnapshot.
+always eventually assertion SnapshotEventuallyCloses:
+    return not snap_reader.active

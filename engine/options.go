@@ -51,6 +51,11 @@ type Options struct {
 	// append-only so every historical root remains readable without pinning an
 	// MVCC reader. Leave false (default) to reclaim freed pages like BoltDB.
 	NoFreelist bool
+
+	// Tracer optionally receives structured protocol transition events for
+	// formal trace validation (e.g., TLA+ / TLC). Nil disables tracing with zero
+	// allocation overhead.
+	Tracer Tracer
 }
 
 func (o *Options) withDefaults() (Options, error) {

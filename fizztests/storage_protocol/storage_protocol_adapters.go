@@ -184,6 +184,14 @@ func (a *DiskRoleAdapter) ActionCrash(args []mbt.Arg) (any, error) {
 func (a *DiskRoleAdapter) ActionFailSync(args []mbt.Arg) (any, error) {
 	a.h.mu.Lock()
 	defer a.h.mu.Unlock()
+	invalOK := true
+	if len(args) >= 1 {
+		b, ok := args[0].Value.(bool)
+		if !ok {
+			return nil, errInvalidArg
+		}
+		invalOK = b
+	}
 	if a.h.writeTx == nil {
 		return "SKIP", nil
 	}
@@ -193,7 +201,9 @@ func (a *DiskRoleAdapter) ActionFailSync(args []mbt.Arg) (any, error) {
 	}
 
 	// Inject a real Sync() I/O failure on the live process, verify Sync returns
-	// an error, then rollback cleanly and confirm the DB stays usable!
+	// an error, then rollback cleanly (optionally injecting a double-fault
+	// WriteAt failure during Rollback neutralization when invalOK=false so
+	// db.HasDirtyAltMeta() and the SyncDataPages() fence are exercised by MBT!).
 	a.h.storage.SetFailSync(true)
 	var syncErr error
 	if phase == "DATA_WRITTEN" {
@@ -203,15 +213,21 @@ func (a *DiskRoleAdapter) ActionFailSync(args []mbt.Arg) (any, error) {
 	}
 	a.h.storage.SetFailSync(false)
 
-	// Note: if tx had 0 dirty pages (no-op delete), SyncDataPages skips Sync();
-	// still abort cleanly if phase == DATA_WRITTEN or META_WRITTEN.
 	if phase == "META_WRITTEN" && syncErr == nil {
 		return nil, fmt.Errorf("expected SyncMetaPage to fail when SetFailSync(true)")
 	}
 	tx := a.h.writeTx
 	a.h.writeTx = nil
-	if err := tx.Rollback(); err != nil {
-		return nil, fmt.Errorf("rollback after sync failure failed: %w", err)
+	if phase == "META_WRITTEN" && !invalOK {
+		a.h.storage.SetFailWrite(true)
+	}
+	rollbackErr := tx.Rollback()
+	a.h.storage.SetFailWrite(false)
+	if rollbackErr != nil {
+		return nil, fmt.Errorf("rollback after sync failure failed: %w", rollbackErr)
+	}
+	if phase == "META_WRITTEN" && !invalOK && !a.h.db.HasDirtyAltMeta() {
+		return nil, fmt.Errorf("expected db.HasDirtyAltMeta()=true after double-fault FailSync(inval_ok=false)")
 	}
 	if err := a.h.verifyEngineInvariantsLocked(); err != nil {
 		return nil, err

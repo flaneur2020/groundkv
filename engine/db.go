@@ -68,12 +68,14 @@ func OpenStorage(st Storage, opts *Options) (*DB, error) {
 		if err := db.initEmpty(); err != nil {
 			return nil, err
 		}
+		db.emitTraceLocked("Open")
 		return db, nil
 	}
 
 	if err := db.recover(); err != nil {
 		return nil, err
 	}
+	db.emitTraceLocked("Open")
 	return db, nil
 }
 
@@ -354,6 +356,7 @@ func (db *DB) BeginRead() (*Tx, error) {
 		return nil, ErrDBClosed
 	}
 	db.readerCounts[db.meta.TxID]++
+	db.emitTraceLocked("BeginRead")
 	return &Tx{
 		db:       db,
 		writable: false,
@@ -383,6 +386,7 @@ func (db *DB) BeginWrite() (*Tx, error) {
 		freed:    make(map[PageID]struct{}),
 	}
 	db.writeTx = tx
+	db.emitTraceLocked("BeginWrite")
 	return tx, nil
 }
 

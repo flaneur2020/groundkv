@@ -9,14 +9,14 @@ CONTRACT_SPEC := models/contract/kv_contract.fizz
 PROTOCOL_SPEC := models/storage_protocol/storage_protocol.fizz
 BTREE_OPS_SPEC := models/btree_ops/btree_ops.fizz
 
-.PHONY: all verify check-specs check-mutations scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
+.PHONY: all verify check-specs check-mutations check-code-mutations trace-validate scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
 
 all: verify
 
-## verify: Run formal model checking, mutation checks, Go unit/race tests, DST swarm, and MBT adapter smoke tests
-verify: check-specs check-mutations race dst smoke-mbt
+## verify: Run formal model checking, spec & code mutation checks, TLA+ trace validation, race tests, DST swarm, and MBT adapter smoke tests
+verify: check-specs check-mutations check-code-mutations trace-validate race dst smoke-mbt
 
-## check-specs: Exhaustively model-check all 3 FizzBee specs and generate state graphs
+## check-specs: Exhaustively model-check all 3 FizzBee specs (safety + liveness) and generate state graphs
 check-specs:
 	@echo "==> Model checking $(CONTRACT_SPEC)"
 	$(FIZZ) --output-dir models/contract/out/latest $(CONTRACT_SPEC)
@@ -25,9 +25,17 @@ check-specs:
 	@echo "==> Model checking $(BTREE_OPS_SPEC)"
 	$(FIZZ) --output-dir models/btree_ops/out/latest $(BTREE_OPS_SPEC)
 
-## check-mutations: Negative-control mutation proofs verifying formal invariants catch real bugs
+## check-mutations: Negative-control mutation proofs verifying formal safety & liveness invariants catch real bugs
 check-mutations:
 	FIZZ=$(FIZZ) ./scripts/check_mutations.sh
+
+## check-code-mutations: Negative-control mutation proofs directly on Go engine source code
+check-code-mutations:
+	./scripts/check_code_mutations.sh
+
+## trace-validate: Model-check GroundKVProtocol.tla and run TLA+ Trace Validation on real Go DST traces
+trace-validate:
+	./scripts/run_trace_validation.sh
 
 ## scaffold-interfaces: Regenerate FizzBee MBT interfaces & test runners (preserves hand-written adapters)
 scaffold-interfaces:

@@ -9,9 +9,12 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
 - **MVCC Snapshot Isolation & Freelist Reclamation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer; freed pages are persisted as COW freelist chains and recycled strictly when `freeTxID <= min(txid-1, minActiveReaderTxID)`.
 - **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with exclusive `flock` locking and parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage` (`CrashDropUnsynced`, `CrashReorderedMetaOnly`, `CrashTornMetaWrite`).
 - **First-Class FizzBee Specs & Go MBT Harnesses** (`models/`, `fizztests/`):
-  - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT under Go `-race`** on real `OSFileStorage`. Zero coupling to storage internals.
-  - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s, volatile vs. durable page/meta buffers, realistic POSIX `FailSync` + dirty-alt-meta neutralization, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, and all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`). Every safety assertion is non-tautological and verified by 3 formal mutation proofs (`make check-mutations`).
+  - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT under Go `-race`** on real `OSFileStorage`, with formal liveness (`SnapshotEventuallyCloses`). Zero coupling to storage internals.
+  - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s for BOTH B+Tree roots and COW freelist pages, volatile vs. durable page/meta buffers, realistic POSIX `FailSync` + double-fault `dirty_alt_meta` fence, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`), **6 safety invariants + 3 temporal liveness properties**, backed by **5 formal mutation proofs** (`make check-mutations`).
   - `models/btree_ops/btree_ops.fizz` — **Ordered B+Tree & range-scan contract** exercising multi-level splits, deletes, root collapses, empty-tree transitions, and `[start, end)` range scans with freelist enabled.
+- **Unbounded TLA+ Protocol Spec & Formal Trace Validation (`formal/tla/`)**:
+  - `formal/tla/GroundKVProtocol.tla` — Unbounded TLA+ specification of GroundKV's 4-phase dual-meta commit, MVCC freelist watermark, `dirtyAltMeta` fence, and crash recovery.
+  - `formal/tla/GroundKVTrace.tla` — TLC **Formal Trace Validation** (`make trace-validate`) replaying real NDJSON traces emitted by `engine.JSONLineTracer` during unbounded DST swarm runs (with crashes, I/O faults, and MVCC readers) back against `GroundKVProtocol!Next`.
 
 ## Project Layout
 
@@ -21,9 +24,13 @@ groundkv/
 │   ├── contract/kv_contract.fizz            # Black-box API contract (multi-role + parallel linearizability)
 │   ├── storage_protocol/storage_protocol.fizz # Unified Disk + Engine COW/freelist/MVCC/crash protocol
 │   └── btree_ops/btree_ops.fizz             # Ordered B+Tree & range-scan contract
+├── formal/tla/            # Unbounded TLA+ protocol spec & TLC Formal Trace Validation
+│   ├── GroundKVProtocol.tla # Formal storage protocol (4-phase commit, MVCC freelist, dirtyAltMeta fence, crash recovery)
+│   └── GroundKVTrace.tla    # TLA+ Trace Validation checking real Go NDJSON execution traces against GroundKVProtocol
 ├── engine/                # Core Go storage engine
-│   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, errors
-│   ├── storage.go         # Storage interface, OSFileStorage, per-write fault-injecting MemStorage
+│   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, Tracer, errors
+│   ├── storage.go         # Storage interface, OSFileStorage (+ flock), fault-injecting MemStorage
+│   ├── trace.go           # Zero-overhead-when-nil structured NDJSON protocol tracer for TLA+ Trace Validation
 │   ├── page.go            # Binary page codec (Meta/Branch/Leaf/Freelist) + CRC32 checksums
 │   ├── meta.go            # Dual meta page (page 0/1) atomic commit & recovery
 │   ├── freelist.go        # On-disk COW freelist chain + pending/free MVCC page reclamation
@@ -42,7 +49,7 @@ groundkv/
 │   ├── dst_test.go        # TestDSTSwarm, TestDSTSteadyStateReclamation, TestDSTReplay (-dst-seed=<N>)
 │   ├── oscrash_test.go    # Real subprocess SIGKILL crash-recovery test on OSFileStorage + flock
 │   └── linearizability_test.go # Concurrent real-time linearizability & MVCC snapshot verifier (-race)
-├── scripts/               # MBT runner, formal spec mutation checks & coverage merger
+├── scripts/               # MBT runner, formal spec & Go code mutation checks, TLA+ trace validator & coverage merger
 ├── cmd/
 │   ├── groundkv/          # Simple CLI (put, get, del, scan, meta, verify)
 │   └── groundkv-dst/      # Standalone DST swarm runner (-seed, -seeds, -steps)

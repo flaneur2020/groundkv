@@ -120,6 +120,7 @@ type MemStorage struct {
 	syncCount int
 	closed    bool
 	failSync  bool
+	failWrite bool
 }
 
 // NewMemStorage creates a fresh empty MemStorage.
@@ -154,6 +155,9 @@ func (m *MemStorage) WriteAt(p []byte, off int64) (int, error) {
 	}
 	if off < 0 {
 		return 0, errors.New("groundkv: negative write offset")
+	}
+	if m.failWrite {
+		return 0, errors.New("groundkv: injected write failure")
 	}
 	applyWrite(&m.working, off, p)
 	cp := make([]byte, len(p))
@@ -298,6 +302,13 @@ func (m *MemStorage) SetFailSync(fail bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failSync = fail
+}
+
+// SetFailWrite toggles injected WriteAt errors for fault-injection tests.
+func (m *MemStorage) SetFailWrite(fail bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failWrite = fail
 }
 
 func applyWrite(dst *[]byte, off int64, data []byte) {

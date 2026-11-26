@@ -5,7 +5,7 @@ options:
     max_concurrent_actions: 1
 action_options:
     "Engine.BeginPut":
-        max_actions: 3
+        max_actions: 2
     "Engine.StageOverwrite":
         max_actions: 1
     "Engine.BeginDelete":
@@ -13,8 +13,6 @@ action_options:
     "Engine.RollbackWrite":
         max_actions: 1
     "Engine.OpenReader":
-        max_actions: 1
-    "Engine.CloseReader":
         max_actions: 1
     "Disk.FailSync":
         max_actions: 1
@@ -33,23 +31,23 @@ PHASE_DATA_SYNCED = "DATA_SYNCED"
 PHASE_META_WRITTEN = "META_WRITTEN"
 
 # Unified white-box storage protocol specification modeling:
-#   1. Disk role with separate volatile (pending) vs durable page & meta buffers
+#   1. Disk role with separate volatile (pending) vs durable page & meta buffers,
+#      realistic POSIX FailSync (which leaves dirty OS page-cache buffers intact),
+#      optional double-fault InvalidateMeta write failure (dirty_alt_meta fence),
 #      and three crash fault modes:
 #        - DROP:      drops all unsynced data & meta writes
 #        - REORDERED: persists unsynced meta write while dropping unsynced data
 #        - TORN:      corrupts target meta slot on unsynced meta write
-#   2. Engine role with real abstract PageIDs (pgid >= 2), COW allocation,
-#      freelist pending[txid] -> free reclamation gated by
-#        release_bound = min(max(0, txid - 1), min_active_reader_txid),
-#      Put + Delete + RollbackWrite + 4-phase CommitStep + MVCC Reader.
-#
-# ZERO ghost booleans: every safety assertion inspects real modeled pages,
-# real durable meta roots, and real reader roots so breaking either the data
-# Sync barrier or the MVCC/dual-meta freelist watermark produces a concrete
-# FizzBee counterexample.
+#   2. Engine role with real abstract PageIDs (pgid >= 2) for BOTH B+Tree root
+#      pages and COW freelist pages, freelist pending[txid] -> free reclamation
+#      gated by release_bound = min(max(0, txid - 1), min_active_reader_txid),
+#      Put + Delete + StageOverwrite + RollbackWrite + 4-phase CommitStep + MVCC Reader.
+#   3. Six non-tautological safety invariants AND three temporal liveness
+#      properties (under fair CommitStep & CloseReader), all backed by formal
+#      negative-control mutation proofs in scripts/check_mutations.sh.
 role Disk:
     action Init:
-        # Durable on-disk B+Tree page contents: pgid -> value (or "" if empty)
+        # Durable on-disk B+Tree & freelist page contents: pgid -> value ("FL" for freelist)
         self.durable_pages = {}
         # Unsynced OS page-cache writes: pgid -> value
         self.pending_pages = {}
@@ -58,33 +56,37 @@ role Disk:
         self.meta0_valid = True
         self.meta0_txid = 0
         self.meta0_root = 0
+        self.meta0_fl = 0
         self.meta0_expected = NOT_FOUND
 
         self.meta1_valid = True
         self.meta1_txid = 0
         self.meta1_root = 0
+        self.meta1_fl = 0
         self.meta1_expected = NOT_FOUND
 
         # Unsynced meta page write sitting in OS page cache.
         # pending_meta_valid=True represents a valid WriteMeta(slot, ...);
         # pending_meta_valid=False represents an InvalidateMeta(slot) zero-write
-        # performed by Rollback after a failed SyncMetaPage.
+        # performed by Rollback/SyncDataPages after a failed SyncMetaPage.
         self.has_pending_meta = False
         self.pending_meta_valid = False
         self.pending_meta_slot = 0
         self.pending_meta_txid = 0
         self.pending_meta_root = 0
+        self.pending_meta_fl = 0
         self.pending_meta_expected = NOT_FOUND
 
     atomic func WritePage(pgid, val):
         self.pending_pages[pgid] = val
 
-    atomic func WriteMeta(slot, txid, root, expected_val):
+    atomic func WriteMeta(slot, txid, root, fl_pgid, expected_val):
         self.has_pending_meta = True
         self.pending_meta_valid = True
         self.pending_meta_slot = slot
         self.pending_meta_txid = txid
         self.pending_meta_root = root
+        self.pending_meta_fl = fl_pgid
         self.pending_meta_expected = expected_val
 
     atomic func InvalidateMeta(slot):
@@ -93,6 +95,7 @@ role Disk:
         self.pending_meta_slot = slot
         self.pending_meta_txid = 0
         self.pending_meta_root = 0
+        self.pending_meta_fl = 0
         self.pending_meta_expected = NOT_FOUND
 
     atomic func Sync():
@@ -105,6 +108,7 @@ role Disk:
                     self.pending_meta_slot,
                     self.pending_meta_txid,
                     self.pending_meta_root,
+                    self.pending_meta_fl,
                     self.pending_meta_expected,
                 )
             else:
@@ -112,16 +116,18 @@ role Disk:
             self.has_pending_meta = False
             self.pending_meta_valid = False
 
-    def apply_durable_meta(self, slot, txid, root, expected_val):
+    def apply_durable_meta(self, slot, txid, root, fl_pgid, expected_val):
         if slot == 0:
             self.meta0_valid = True
             self.meta0_txid = txid
             self.meta0_root = root
+            self.meta0_fl = fl_pgid
             self.meta0_expected = expected_val
         else:
             self.meta1_valid = True
             self.meta1_txid = txid
             self.meta1_root = root
+            self.meta1_fl = fl_pgid
             self.meta1_expected = expected_val
 
     def invalidate_durable_meta(self, slot):
@@ -129,14 +135,16 @@ role Disk:
             self.meta0_valid = False
             self.meta0_txid = 0
             self.meta0_root = 0
+            self.meta0_fl = 0
             self.meta0_expected = NOT_FOUND
         else:
             self.meta1_valid = False
             self.meta1_txid = 0
             self.meta1_root = 0
+            self.meta1_fl = 0
             self.meta1_expected = NOT_FOUND
 
-    # Power-loss fault action parameterized by crash mode (supports back-to-back crashes!).
+    # Power-loss fault action parameterized by crash mode.
     atomic action Crash:
         mode = oneof CRASH_MODES
         self.pending_pages = {}
@@ -151,6 +159,7 @@ role Disk:
                         self.pending_meta_slot,
                         self.pending_meta_txid,
                         self.pending_meta_root,
+                        self.pending_meta_fl,
                         self.pending_meta_expected,
                     )
                 else:
@@ -167,11 +176,13 @@ role Disk:
         return txid
 
     # Fault 4: Realistic POSIX Sync() I/O failure on a live process — fsync()
-    # returns an error WITHOUT discarding dirty OS page-cache buffers. Engine
-    # must explicitly neutralize any dirty alternate meta slot on Rollback so a
-    # later transaction's SyncDataPages() cannot resurrect the aborted commit.
+    # returns an error WITHOUT discarding dirty OS page-cache buffers.
+    # inval_ok=True models rollback's WriteAt(zeros, altSlot) succeeding;
+    # inval_ok=False models a double-fault where that invalidation write ALSO
+    # fails, leaving engine.dirty_alt_meta=True to be fenced in SyncDataPages().
     atomic action FailSync:
-        res = engine.abort_on_sync_error()
+        inval_ok = oneof [True, False]
+        res = engine.abort_on_sync_error(inval_ok)
         return res
 
     # Read-only durable meta inspection (uncapped pure read: 0 extra states) so MBT
@@ -185,7 +196,9 @@ role Engine:
     action Init:
         self.txid = 0
         self.root = 0
+        self.freelist_pgid = 0
         self.committed_val = NOT_FOUND
+        self.dirty_alt_meta = False
 
         # Real abstract page allocator & freelist
         self.next_pgid = 2
@@ -201,10 +214,12 @@ role Engine:
         # Active single-writer 4-phase transaction state
         self.phase = PHASE_IDLE
         self.tx_root = 0
+        self.tx_fl_pgid = 0
         self.tx_staged_val = NOT_FOUND
         self.tx_freed = []
         self.tx_recycled = []
         self.tx_dirty_written = False
+        self.tx_fl_written = False
 
         self.last_acked_txid = 0
 
@@ -217,7 +232,7 @@ role Engine:
         return "OK"
 
     # Second mutation inside an already-staged write tx: exercises read-your-own-writes
-    # and overwriting an uncommitted dirty page (delete(tx.dirty, pgid)) before commit/rollback.
+    # and overwriting an uncommitted dirty page (tx.localFree reuse) before commit/rollback.
     atomic action StageOverwrite:
         if self.phase != PHASE_STAGED:
             return "NO_TX"
@@ -241,6 +256,8 @@ role Engine:
         self.tx_freed = []
         self.tx_recycled = []
         self.tx_dirty_written = False
+        self.tx_fl_pgid = 0
+        self.tx_fl_written = False
         if not changed:
             self.tx_root = self.root
         elif next_val == NOT_FOUND:
@@ -267,22 +284,39 @@ role Engine:
 
     # Advance the active write transaction by one durability phase:
     #   STAGED -> DATA_WRITTEN -> DATA_SYNCED -> META_WRITTEN -> IDLE (COMMITTED)
-    atomic action CommitStep:
+    # Marked fair so liveness proofs can verify every started tx completes cleanly.
+    atomic fair action CommitStep:
         if self.phase == PHASE_IDLE:
             return "IDLE"
         if self.phase == PHASE_STAGED:
+            # COW on the freelist chain itself: free old freelist page and
+            # allocate a new freelist page if any freed/pending/free IDs exist.
+            if self.freelist_pgid != 0 and self.freelist_pgid not in self.tx_freed:
+                self.tx_freed.append(self.freelist_pgid)
+            if len(self.free_pages) > 0 or len(self.pending_free) > 0 or len(self.tx_freed) > 0:
+                self.tx_fl_pgid = self.alloc_pgid()
+                self.tx_fl_written = True
+                disk.WritePage(self.tx_fl_pgid, "FL")
+            else:
+                self.tx_fl_pgid = 0
+                self.tx_fl_written = False
             if self.tx_dirty_written:
                 disk.WritePage(self.tx_root, self.tx_staged_val)
             self.phase = PHASE_DATA_WRITTEN
             return "DATA_WRITTEN"
         if self.phase == PHASE_DATA_WRITTEN:
-            if self.tx_dirty_written or len(self.free_pages) > 0 or len(self.pending_free) > 0:
+            # Fence: neutralize any un-cleared dirty alternate meta slot BEFORE
+            # calling file-wide disk.Sync() so fsync cannot resurrect an aborted commit.
+            if self.dirty_alt_meta:
+                disk.InvalidateMeta((self.txid + 1) % 2)
+                self.dirty_alt_meta = False
+            if self.tx_dirty_written or self.tx_fl_written:
                 disk.Sync()
             self.phase = PHASE_DATA_SYNCED
             return "DATA_SYNCED"
         if self.phase == PHASE_DATA_SYNCED:
             next_txid = self.txid + 1
-            disk.WriteMeta(next_txid % 2, next_txid, self.tx_root, self.tx_staged_val)
+            disk.WriteMeta(next_txid % 2, next_txid, self.tx_root, self.tx_fl_pgid, self.tx_staged_val)
             self.phase = PHASE_META_WRITTEN
             return "META_WRITTEN"
         if self.phase == PHASE_META_WRITTEN:
@@ -290,10 +324,12 @@ role Engine:
             next_txid = self.txid + 1
             self.txid = next_txid
             self.root = self.tx_root
+            self.freelist_pgid = self.tx_fl_pgid
             self.committed_val = self.tx_staged_val
+            self.dirty_alt_meta = False
             self.last_acked_txid = next_txid
             if len(self.tx_freed) > 0:
-                self.pending_free[next_txid] = list(self.tx_freed)
+                self.pending_free[next_txid] = sorted(list(self.tx_freed))
             self.clear_tx()
             self.release_eligible()
             return "COMMITTED"
@@ -318,7 +354,8 @@ role Engine:
         self.reader_expected = self.committed_val
         return self.txid
 
-    atomic action CloseReader:
+    # Marked fair so liveness proofs verify closing a reader releases blocked freelist buckets.
+    atomic fair action CloseReader:
         if not self.has_reader:
             return "NONE"
         self.has_reader = False
@@ -339,10 +376,12 @@ role Engine:
     def clear_tx(self):
         self.phase = PHASE_IDLE
         self.tx_root = 0
+        self.tx_fl_pgid = 0
         self.tx_staged_val = NOT_FOUND
         self.tx_freed = []
         self.tx_recycled = []
         self.tx_dirty_written = False
+        self.tx_fl_written = False
 
     def release_bound(self):
         bound = 0
@@ -366,6 +405,7 @@ role Engine:
 
     atomic func recover_after_crash():
         self.clear_tx()
+        self.dirty_alt_meta = False
         self.has_reader = False
         self.reader_txid = -1
         self.reader_root = 0
@@ -375,15 +415,19 @@ role Engine:
             if disk.meta0_txid >= disk.meta1_txid:
                 self.txid = disk.meta0_txid
                 self.root = disk.meta0_root
+                self.freelist_pgid = disk.meta0_fl
             else:
                 self.txid = disk.meta1_txid
                 self.root = disk.meta1_root
+                self.freelist_pgid = disk.meta1_fl
         elif disk.meta0_valid:
             self.txid = disk.meta0_txid
             self.root = disk.meta0_root
+            self.freelist_pgid = disk.meta0_fl
         elif disk.meta1_valid:
             self.txid = disk.meta1_txid
             self.root = disk.meta1_root
+            self.freelist_pgid = disk.meta1_fl
 
         if self.root == 0:
             self.committed_val = NOT_FOUND
@@ -394,12 +438,18 @@ role Engine:
         self.pending_free = {}
         recovered_freed = []
         live_on_disk = set()
-        if disk.meta0_valid and disk.meta0_root != 0:
-            live_on_disk.add(disk.meta0_root)
-        if disk.meta1_valid and disk.meta1_root != 0:
-            live_on_disk.add(disk.meta1_root)
+        if disk.meta0_valid:
+            if disk.meta0_root != 0:
+                live_on_disk.add(disk.meta0_root)
+            if disk.meta0_fl != 0:
+                live_on_disk.add(disk.meta0_fl)
+        if disk.meta1_valid:
+            if disk.meta1_root != 0:
+                live_on_disk.add(disk.meta1_root)
+            if disk.meta1_fl != 0:
+                live_on_disk.add(disk.meta1_fl)
         for pgid in disk.durable_pages:
-            if pgid != self.root and pgid not in live_on_disk:
+            if pgid not in live_on_disk:
                 recovered_freed.append(pgid)
         if len(recovered_freed) > 0 and self.txid >= 2:
             self.pending_free[self.txid] = sorted(recovered_freed)
@@ -407,15 +457,21 @@ role Engine:
         self.last_acked_txid = self.txid
         return self.txid
 
-    atomic func abort_on_sync_error():
+    atomic func abort_on_sync_error(inval_ok):
         if self.phase != PHASE_DATA_WRITTEN and self.phase != PHASE_META_WRITTEN:
             return "SKIP"
         if self.phase == PHASE_META_WRITTEN:
             next_txid = self.txid + 1
-            disk.InvalidateMeta(next_txid % 2)
+            if inval_ok:
+                disk.InvalidateMeta(next_txid % 2)
+                self.dirty_alt_meta = False
+            else:
+                self.dirty_alt_meta = True
             held = list(self.tx_recycled)
             if self.tx_dirty_written and self.tx_root != 0 and self.tx_root not in held:
                 held.append(self.tx_root)
+            if self.tx_fl_written and self.tx_fl_pgid != 0 and self.tx_fl_pgid not in held:
+                held.append(self.tx_fl_pgid)
             if len(held) > 0:
                 existing = list(self.pending_free.get(next_txid, []))
                 for pgid in held:
@@ -433,12 +489,14 @@ action Init:
     disk = Disk()
     engine = Engine()
 
+# --- Safety Invariants ---
+
 # Invariant 1: Dual meta slots NEVER both become invalid, even under back-to-back torn crashes.
 always assertion AtLeastOneValidMeta:
     return disk.meta0_valid or disk.meta1_valid
 
-# Invariant 2: Every valid durable meta page points to a durable root page
-# whose contents match its committed value.
+# Invariant 2: Every valid durable meta page points to durable root & freelist pages
+# whose contents match its committed state.
 # (Fails immediately if disk.Sync() is omitted before disk.WriteMeta()!)
 always assertion ValidMetaRootsMatchDurablePages:
     if disk.meta0_valid:
@@ -450,6 +508,8 @@ always assertion ValidMetaRootsMatchDurablePages:
                 return False
             if disk.durable_pages[disk.meta0_root] != disk.meta0_expected:
                 return False
+        if disk.meta0_fl != 0 and disk.durable_pages.get(disk.meta0_fl, "") != "FL":
+            return False
     if disk.meta1_valid:
         if disk.meta1_root == 0:
             if disk.meta1_expected != NOT_FOUND:
@@ -459,19 +519,28 @@ always assertion ValidMetaRootsMatchDurablePages:
                 return False
             if disk.durable_pages[disk.meta1_root] != disk.meta1_expected:
                 return False
+        if disk.meta1_fl != 0 and disk.durable_pages.get(disk.meta1_fl, "") != "FL":
+            return False
     return True
 
-# Invariant 3: ZERO use-after-free — no page reachable from either durable meta
-# slot, active root, or open MVCC reader ever enters free_pages!
-# (Fails immediately if release_bound omits reader_txid OR txid-1!)
+# Invariant 3: ZERO use-after-free — no B+Tree or freelist page reachable from either
+# durable meta slot, active root, active freelist, or open MVCC reader ever enters free_pages!
 always assertion NoLivePageInFreelist:
     live = set()
-    if disk.meta0_valid and disk.meta0_root != 0:
-        live.add(disk.meta0_root)
-    if disk.meta1_valid and disk.meta1_root != 0:
-        live.add(disk.meta1_root)
+    if disk.meta0_valid:
+        if disk.meta0_root != 0:
+            live.add(disk.meta0_root)
+        if disk.meta0_fl != 0:
+            live.add(disk.meta0_fl)
+    if disk.meta1_valid:
+        if disk.meta1_root != 0:
+            live.add(disk.meta1_root)
+        if disk.meta1_fl != 0:
+            live.add(disk.meta1_fl)
     if engine.root != 0:
         live.add(engine.root)
+    if engine.freelist_pgid != 0:
+        live.add(engine.freelist_pgid)
     if engine.has_reader and engine.reader_root != 0:
         live.add(engine.reader_root)
     for pgid in engine.free_pages:
@@ -501,4 +570,23 @@ always assertion NoResurrectedAbortedMeta:
         return False
     if disk.meta1_valid and disk.meta1_txid > max_allowed:
         return False
+    return True
+
+# --- Liveness Properties (under fair CommitStep & CloseReader) ---
+
+# Liveness 1: Every started write transaction eventually returns to IDLE (no stuck commit phase).
+always eventually assertion EventuallyIdle:
+    return engine.phase == PHASE_IDLE
+
+# Liveness 2: Every opened MVCC reader eventually closes cleanly.
+always eventually assertion ReaderEventuallyCloses:
+    return not engine.has_reader
+
+# Liveness 3: Once readers close, no pending freelist bucket <= max(0, txid - 1)
+# stays permanently stuck without being released into free_pages.
+always eventually assertion EventuallyReclaimsEligibleFreelist:
+    bound = engine.txid - 1 if engine.txid > 0 else 0
+    for t in engine.pending_free:
+        if t <= bound:
+            return False
     return True

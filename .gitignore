@@ -1,5 +1,15 @@
+# Build & coverage outputs
 bin/
 coverage/
 *.db
+
+# FizzBee generated model-checker artifacts
 models/**/out/
 models/**/*.json
+
+# TLA+ TLC generated state/trace artifacts
+states/
+formal/tla/states/
+*.ndjson
+*.old
+*.jar
