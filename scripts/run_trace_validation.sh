@@ -92,7 +92,7 @@ PY
 for bad_file in "$BAD_RESURRECT" "$BAD_WATERMARK"; do
   bname="$(basename "$bad_file")"
   if TRACE_PATH="$bad_file" java -XX:+UseParallelGC -cp "$CP" tlc2.TLC \
-    -workers 1 -cleanup -metadir "${WORK_DIR}/meta-${bname}" \
+    -workers 1 -cleanup -noGenerateSpecTE -metadir "${WORK_DIR}/meta-${bname}" \
     -config formal/tla/GroundKVTrace.cfg \
     formal/tla/GroundKVTrace.tla > "${WORK_DIR}/${bname}.log" 2>&1; then
     echo "    ERROR: negative-control trace '${bname}' was NOT rejected by TLA+!" >&2

@@ -10,6 +10,9 @@ models/**/*.json
 # TLA+ TLC generated state/trace artifacts
 states/
 formal/tla/states/
+formal/tla/*_TTrace_*
+*_TTrace_*.tla
+*_TTrace_*.bin
 *.ndjson
 *.old
 *.jar

@@ -111,4 +111,4 @@ build:
 
 ## clean: Remove generated model-checker artifacts, coverage files, and build outputs
 clean:
-	rm -rf bin/ coverage/ models/contract/out models/contract/*.json models/storage_protocol/out models/storage_protocol/*.json models/btree_ops/out models/btree_ops/*.json
+	rm -rf bin/ coverage/ models/contract/out models/contract/*.json models/storage_protocol/out models/storage_protocol/*.json models/btree_ops/out models/btree_ops/*.json formal/tla/*_TTrace_* formal/tla/states
