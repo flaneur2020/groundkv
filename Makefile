@@ -9,12 +9,12 @@ CONTRACT_SPEC := models/contract/kv_contract.fizz
 PROTOCOL_SPEC := models/storage_protocol/storage_protocol.fizz
 BTREE_OPS_SPEC := models/btree_ops/btree_ops.fizz
 
-.PHONY: all verify check-specs check-mutations check-code-mutations trace-validate scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
+.PHONY: all verify check-specs check-mutations check-code-mutations trace-validate prove scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
 
 all: verify
 
-## verify: Run formal model checking, spec & code mutation checks, TLA+ trace validation, race tests, DST swarm, and MBT adapter smoke tests
-verify: check-specs check-mutations check-code-mutations trace-validate race dst smoke-mbt
+## verify: Run Lean 4 proofs, FizzBee model checking, spec & code mutation checks, TLA+ trace validation, race tests, DST swarm, and MBT adapter smoke tests
+verify: prove check-specs check-mutations check-code-mutations trace-validate race dst smoke-mbt
 
 ## check-specs: Exhaustively model-check all 3 FizzBee specs (safety + liveness) and generate state graphs
 check-specs:
@@ -36,6 +36,10 @@ check-code-mutations:
 ## trace-validate: Model-check GroundKVProtocol.tla and run TLA+ Trace Validation on real Go DST traces
 trace-validate:
 	./scripts/run_trace_validation.sh
+
+## prove: Build and axiom-audit all unbounded Lean 4 formal proofs under formal/lean/
+prove:
+	./scripts/check_lean_proofs.sh
 
 ## scaffold-interfaces: Regenerate FizzBee MBT interfaces & test runners (preserves hand-written adapters)
 scaffold-interfaces:
@@ -111,4 +115,4 @@ build:
 
 ## clean: Remove generated model-checker artifacts, coverage files, and build outputs
 clean:
-	rm -rf bin/ coverage/ models/contract/out models/contract/*.json models/storage_protocol/out models/storage_protocol/*.json models/btree_ops/out models/btree_ops/*.json formal/tla/*_TTrace_* formal/tla/states
+	rm -rf bin/ coverage/ models/contract/out models/contract/*.json models/storage_protocol/out models/storage_protocol/*.json models/btree_ops/out models/btree_ops/*.json formal/tla/*_TTrace_* formal/tla/states formal/lean/.lake formal/lean/lake-manifest.json

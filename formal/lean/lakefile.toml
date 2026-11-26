@@ -1,0 +1,6 @@
+name = "groundkv_proofs"
+version = "0.1.0"
+defaultTargets = ["GroundKV"]
+
+[[lean_lib]]
+name = "GroundKV"

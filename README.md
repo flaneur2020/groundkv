@@ -12,6 +12,12 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
   - `models/contract/kv_contract.fizz` — **Black-box external contract** (`Writer` + 2 concurrent `Reader`s + `SnapshotReader`), tested with **real parallel MBT under Go `-race`** on real `OSFileStorage`, with formal liveness (`SnapshotEventuallyCloses`). Zero coupling to storage internals.
   - `models/storage_protocol/storage_protocol.fizz` — **Unified white-box storage protocol** (`Disk` + `Engine`), modeling real abstract `pgid`s for BOTH B+Tree roots and COW freelist pages, volatile vs. durable page/meta buffers, realistic POSIX `FailSync` + double-fault `dirty_alt_meta` fence, freelist `pending` → `free` reclamation, `Put`/`Delete`/`RollbackWrite`, MVCC reader pinning, all 3 disk crash modes (`DROP`, `REORDERED`, `TORN`), **6 safety invariants + 3 temporal liveness properties**, backed by **5 formal mutation proofs** (`make check-mutations`).
   - `models/btree_ops/btree_ops.fizz` — **Ordered B+Tree & range-scan contract** exercising multi-level splits, deletes, root collapses, empty-tree transitions, and `[start, end)` range scans with freelist enabled.
+- **Unbounded Machine-Checked Lean 4 Proofs (`formal/lean/`, `make prove`)**:
+  - `GroundKV/DualMeta.lean` — Unbounded inductive proof of dual-meta crash atomicity, durability, `AtLeastOneValidMeta`, `AllValidMetasHaveDurableData`, and `NoResurrectedAbortedMeta` across arbitrary `TxID ∈ ℕ`, crashes, and POSIX `FailSync` / `dirtyAltMeta` double faults.
+  - `GroundKV/FreelistMVCC.lean` — Unbounded zero use-after-free proof (`no_live_page_in_free`) for arbitrary `TxID ∈ ℕ` and arbitrary numbers of concurrent MVCC readers.
+  - `GroundKV/FreelistSizing.lean` — Sufficiency & strict minimality of `prepareFreelistPages()`, plus proof of steady-state convergence for `perPage >= 3` and unbounded divergence for `perPage <= 2`.
+  - `GroundKV/BTreeSplit.lean` — Total termination, lossless order-preserving partition (`flatten`), non-emptiness, and page/key capacity proofs for GroundKV's byte-aware 2-way + greedy multi-way split algorithm.
+  - Zero `sorry`, zero custom axioms (pure Lean 4 stdlib, verified via `#print axioms` in CI).
 - **Unbounded TLA+ Protocol Spec & Formal Trace Validation (`formal/tla/`)**:
   - `formal/tla/GroundKVProtocol.tla` — Unbounded TLA+ specification of GroundKV's 4-phase dual-meta commit, MVCC freelist watermark, `dirtyAltMeta` fence, and crash recovery.
   - `formal/tla/GroundKVTrace.tla` — TLC **Formal Trace Validation** (`make trace-validate`) replaying real NDJSON traces emitted by `engine.JSONLineTracer` during unbounded DST swarm runs (with crashes, I/O faults, and MVCC readers) back against `GroundKVProtocol!Next`.
@@ -24,9 +30,9 @@ groundkv/
 │   ├── contract/kv_contract.fizz            # Black-box API contract (multi-role + parallel linearizability)
 │   ├── storage_protocol/storage_protocol.fizz # Unified Disk + Engine COW/freelist/MVCC/crash protocol
 │   └── btree_ops/btree_ops.fizz             # Ordered B+Tree & range-scan contract
-├── formal/tla/            # Unbounded TLA+ protocol spec & TLC Formal Trace Validation
-│   ├── GroundKVProtocol.tla # Formal storage protocol (4-phase commit, MVCC freelist, dirtyAltMeta fence, crash recovery)
-│   └── GroundKVTrace.tla    # TLA+ Trace Validation checking real Go NDJSON execution traces against GroundKVProtocol
+├── formal/                # Unbounded formal proofs & trace validation
+│   ├── lean/              # Machine-checked Lean 4 proofs (DualMeta, FreelistMVCC, FreelistSizing, BTreeSplit; 13 theorems, 0 sorry)
+│   └── tla/               # Unbounded TLA+ protocol spec (GroundKVProtocol.tla) & TLC Trace Validation (GroundKVTrace.tla)
 ├── engine/                # Core Go storage engine
 │   ├── options.go         # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, Tracer, errors
 │   ├── storage.go         # Storage interface, OSFileStorage (+ flock), fault-injecting MemStorage

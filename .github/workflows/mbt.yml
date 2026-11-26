@@ -65,6 +65,28 @@ jobs:
           path: ~/.local/tla-tools
           key: tla-tools-1.8.0-community-v1
 
+      - name: Cache Lean 4 toolchain (elan v4.16.0)
+        id: cache-lean
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-lean-4.16.0-linux-x86_64
+
+      - name: Install Lean 4 (elan)
+        if: steps.cache-lean.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+            https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh
+          sh /tmp/elan-init.sh -y --default-toolchain leanprover/lean4:v4.16.0 --no-modify-path
+          rm -f /tmp/elan-init.sh
+
+      - name: Add Lean 4 to PATH
+        run: echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Unbounded Lean 4 Machine-Checked Proofs (13 theorems, zero sorry)
+        run: make prove
+
       - name: Go vet
         run: go vet ./...
 

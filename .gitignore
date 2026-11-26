@@ -16,3 +16,7 @@ formal/tla/*_TTrace_*
 *.ndjson
 *.old
 *.jar
+
+# Lean 4 build artifacts
+formal/lean/.lake/
+formal/lean/lake-manifest.json
