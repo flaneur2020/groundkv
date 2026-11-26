@@ -9,12 +9,12 @@ CONTRACT_SPEC := models/contract/kv_contract.fizz
 PROTOCOL_SPEC := models/storage_protocol/storage_protocol.fizz
 BTREE_OPS_SPEC := models/btree_ops/btree_ops.fizz
 
-.PHONY: all verify check-specs check-mutations check-code-mutations trace-validate prove scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
+.PHONY: all verify check-specs check-mutations check-code-mutations trace-validate prove dafny dafny-build scaffold-interfaces test race dst fuzz smoke-mbt mbt mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage build clean
 
 all: verify
 
-## verify: Run Lean 4 proofs, FizzBee model checking, spec & code mutation checks, TLA+ trace validation, race tests, DST swarm, and MBT adapter smoke tests
-verify: prove check-specs check-mutations check-code-mutations trace-validate race dst smoke-mbt
+## verify: Run Dafny verification & codegen audit, Lean 4 proofs, FizzBee model checking, spec & code mutation checks, TLA+ trace validation, race tests, DST swarm, and MBT adapter smoke tests
+verify: dafny prove check-specs check-mutations check-code-mutations trace-validate race dst smoke-mbt
 
 ## check-specs: Exhaustively model-check all 3 FizzBee specs (safety + liveness) and generate state graphs
 check-specs:
@@ -41,6 +41,14 @@ trace-validate:
 prove:
 	./scripts/check_lean_proofs.sh
 
+## dafny: Verify all Phase 1 & Phase 2 Dafny proofs, audit zero bypasses, and check verified/dafnygen/ reproducibility
+dafny:
+	./scripts/check_dafny.sh
+
+## dafny-build: Verify Dafny proofs and regenerate verified/dafnygen/ Go packages
+dafny-build:
+	./scripts/build_dafny.sh
+
 ## scaffold-interfaces: Regenerate FizzBee MBT interfaces & test runners (preserves hand-written adapters)
 scaffold-interfaces:
 	$(FIZZ) mbt-scaffold --lang go --go-package contract_mbt --out-dir fizztests/contract $(CONTRACT_SPEC)
@@ -48,13 +56,13 @@ scaffold-interfaces:
 	$(FIZZ) mbt-scaffold --lang go --go-package btree_ops_mbt --out-dir fizztests/btree_ops $(BTREE_OPS_SPEC)
 	gofmt -w fizztests/contract fizztests/storage_protocol fizztests/btree_ops
 
-## test: Run Go unit, crash-recovery, freelist, fuzz-seed, and COW immutability tests
+## test: Run Go unit, crash-recovery, freelist, fuzz-seed, COW immutability, and Dafny-verified engine tests
 test:
-	go test -v ./engine/...
+	go test -v ./engine/... ./verified
 
-## race: Run Go engine tests and concurrent linearizability stress tests under the race detector
+## race: Run pure-Go engine tests, Dafny-verified engine tests, and concurrent linearizability stress tests under the race detector
 race:
-	go test -race -v ./engine/...
+	go test -race -v ./engine/... ./verified
 	go test -race -v -run TestConcurrentLinearizability ./dst
 
 ## dst: Run Deterministic Simulation Testing (7 Swarm profiles, 19 scenario coverage checks, SIGKILL crash recovery & linearizability)

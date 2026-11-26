@@ -12,6 +12,7 @@ permissions:
 env:
   FIZZBEE_VERSION: "0.5.4"
   FIZZBEE_MBT_VERSION: "0.2.0"
+  DAFNY_VERSION: "4.11.0"
 
 jobs:
   mbt:
@@ -84,11 +85,41 @@ jobs:
       - name: Add Lean 4 to PATH
         run: echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
+      - name: Cache Dafny toolchain (v4.11.0)
+        id: cache-dafny
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/dafny
+          key: dafny-${{ env.DAFNY_VERSION }}-linux-x64
+
+      - name: Install Dafny & goimports
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.local/dafny/dafny" ]; then
+            mkdir -p "$HOME/.local"
+            curl -fsSL --retry 3 --retry-delay 2 \
+              "https://github.com/dafny-lang/dafny/releases/download/v${DAFNY_VERSION}/dafny-${DAFNY_VERSION}-x64-ubuntu-22.04.zip" \
+              -o /tmp/dafny.zip
+            unzip -q -o /tmp/dafny.zip -d "$HOME/.local"
+            rm -f /tmp/dafny.zip
+          fi
+          go install golang.org/x/tools/cmd/goimports@latest
+
+      - name: Add Dafny & Go bin to PATH
+        run: |
+          echo "$HOME/.local/dafny" >> "$GITHUB_PATH"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Dafny Verified Implementation Proofs & Go Codegen Audit (Phase 1 + Phase 2, zero assume)
+        run: make dafny
+
       - name: Unbounded Lean 4 Machine-Checked Proofs (13 theorems, zero sorry)
         run: make prove
 
       - name: Go vet
-        run: go vet ./...
+        run: |
+          go vet ./engine/... ./dst/... ./fizztests/... ./cmd/groundkv-dst/...
+          go vet -unreachable=false ./verified/... ./cmd/groundkv/...
 
       - name: Engine unit, crash-recovery, fuzz-seed & race tests
         run: make race
