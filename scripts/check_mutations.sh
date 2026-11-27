@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Negative-control mutation tests for models/storage_protocol/storage_protocol.fizz.
+# Negative-control mutation tests for formal/fizzbee/storage_protocol/storage_protocol.fizz.
 # Ensures formal safety AND liveness invariants genuinely catch protocol bugs and never drift into tautologies.
 
 FIZZ="${FIZZ:-$(command -v fizz || echo "$HOME/bin/fizzbee-v0.5.4-linux_x86/fizz")}"
-SPEC="models/storage_protocol/storage_protocol.fizz"
+SPEC="formal/fizzbee/storage_protocol/storage_protocol.fizz"
 
 TMPDIR="$(mktemp -d /tmp/groundkv-mutations-XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT

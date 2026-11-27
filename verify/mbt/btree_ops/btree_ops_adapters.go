@@ -1,4 +1,4 @@
-// Source: ../../models/btree_ops/btree_ops.fizz
+// Source: ../../../formal/fizzbee/btree_ops/btree_ops.fizz
 // Ordered B+Tree & range-scan contract adapter with freelist enabled and small
 // node fanout caps (MaxLeafKeys=2, MaxBranchKeys=2) to exercise multi-level
 // splits, deletes, root collapse, and [start, end) scans.

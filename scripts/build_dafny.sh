@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Verify all GroundKV Dafny proofs (Phase 1 + Phase 2), audit for zero
 # `assume` / `{:verify false}` cheats, and compile verified Go packages
-# into verified/dafnygen/.
+# into verified/internal/dafnygen/.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAFNY_BIN="${DAFNY:-$HOME/.local/dafny/dafny}"
@@ -46,12 +46,12 @@ echo "==> Translating verified Dafny modules to Go..."
 "$DAFNY_BIN" translate go \
   --no-verify \
   --include-runtime \
-  --go-module-name github.com/flaneur2020/groundkv/verified/dafnygen \
+  --go-module-name github.com/flaneur2020/groundkv/verified/internal/dafnygen \
   --output "$TMP_OUT/dafnygen" \
   formal/dafny/GroundKV.dfy
 
 GEN_SRC="$TMP_OUT/dafnygen-go"
-DEST="$ROOT_DIR/verified/dafnygen"
+DEST="$ROOT_DIR/verified/internal/dafnygen"
 rm -rf "$DEST"
 mkdir -p "$DEST"
 
@@ -64,7 +64,7 @@ done
 
 # Dafny 4.11 omits the --go-module-name prefix in bundled System_/System_.go.
 if [ -f "$DEST/System_/System_.go" ]; then
-  sed -i 's|_dafny "dafny"|_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"|g' "$DEST/System_/System_.go"
+  sed -i 's|_dafny "dafny"|_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"|g' "$DEST/System_/System_.go"
 fi
 
 # Mark all generated Go files with standard Go code-generation header.
@@ -80,5 +80,5 @@ while IFS= read -r -d '' gofile; do
   fi
 done < <(find "$DEST" -name '*.go' -print0)
 
-echo "==> Generated Go packages under verified/dafnygen/:"
+echo "==> Generated Go packages under verified/internal/dafnygen/:"
 find "$DEST" -name '*.go' | sort

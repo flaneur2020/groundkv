@@ -4,38 +4,48 @@ import (
 	"fmt"
 
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVCodec"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVFreelist"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVTypes"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVFreelist"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
-// freelist tracks freed pages in two buckets backed directly by the Z3-verified
-// Dafny GroundKVFreelist.FreelistState.
-type freelist struct {
-	state         GroundKVFreelist.FreelistState
-	reclaimedRuns uint64
-}
+type dafnyFreelistCore struct{}
 
-func newFreelist() *freelist {
-	return &freelist{
-		state: GroundKVFreelist.Companion_Default___.EmptyFreelist(),
-	}
-}
+var (
+	_ engine.FreelistCore = dafnyFreelistCore{}
+	_ engine.FreelistPool = (*dafnyFreelist)(nil)
+)
 
-func (fl *freelist) freeCount() int {
-	return fl.state.Dtor_free().Cardinality().Int()
-}
-
-func (fl *freelist) addPending(txid uint64, ids []PageID) {
+func toDafnyPageIDs(ids []engine.PageID) _dafny.Sequence {
 	if len(ids) == 0 {
-		return
+		return _dafny.EmptySeq
 	}
-	fl.state = GroundKVFreelist.Companion_Default___.AddPending(fl.state, txid, toDafnyPageIDSet(ids))
+	items := make([]interface{}, len(ids))
+	for i, id := range ids {
+		items[i] = uint64(id)
+	}
+	return _dafny.SeqOf(items...)
 }
 
-func (fl *freelist) release(maxSafeTxID uint64) {
-	fl.state = GroundKVFreelist.Companion_Default___.ReleaseEligible(fl.state, maxSafeTxID)
+func fromDafnyPageIDs(seq _dafny.Sequence) []engine.PageID {
+	n := int(seq.Cardinality())
+	out := make([]engine.PageID, n)
+	for i := 0; i < n; i++ {
+		out[i] = engine.PageID(seq.Select(uint32(i)).(uint64))
+	}
+	return out
+}
+
+func toDafnyPageIDSet(ids []engine.PageID) _dafny.Set {
+	if len(ids) == 0 {
+		return _dafny.EmptySet
+	}
+	sb := _dafny.NewBuilder()
+	for _, id := range ids {
+		sb.Add(uint64(id))
+	}
+	return sb.ToSet()
 }
 
 func setToDafnyPageIDSeq(s _dafny.Set) _dafny.Sequence {
@@ -54,7 +64,68 @@ func setToDafnyPageIDSeq(s _dafny.Set) _dafny.Sequence {
 	return _dafny.SeqOf(items...)
 }
 
-func (fl *freelist) pop() (PageID, bool) {
+func (dafnyFreelistCore) MaxFreelistIDsPerPage(pageSize int) int {
+	return GroundKVCodec.Companion_Default___.MaxFreelistIDsPerPage(uint32(pageSize)).Int()
+}
+
+func (dafnyFreelistCore) EncodeFreelistPage(pageSize int, pgid engine.PageID, txid uint64, next engine.PageID, ids []engine.PageID) ([]byte, error) {
+	res := GroundKVCodec.Companion_Default___.EncodeFreelistPage(uint32(pageSize), uint64(pgid), txid, uint64(next), toDafnyPageIDs(ids))
+	if res.Is_Err() {
+		return nil, fmt.Errorf("%w: too many freelist IDs (%d) for page size %d",
+			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), len(ids), pageSize)
+	}
+	return _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence)), nil
+}
+
+func (dafnyFreelistCore) DecodeFreelistPage(buf []byte, h engine.PageHeader) (engine.PageID, []engine.PageID, error) {
+	res := GroundKVCodec.Companion_Default___.DecodeFreelistPage(_dafny.SeqOfBytes(buf), toDafnyHeader(h))
+	if res.Is_Err() {
+		return 0, nil, fmt.Errorf("%w: freelist decode failed (flags %d)",
+			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.Flags)
+	}
+	dec := res.Dtor_value().(GroundKVCodec.DecodedFreelist)
+	return engine.PageID(dec.Dtor_next()), fromDafnyPageIDs(dec.Dtor_ids()), nil
+}
+
+func (dafnyFreelistCore) ReleaseBound(currentTxID uint64, hasReader bool, minActiveReaderTxID uint64) uint64 {
+	return GroundKVFreelist.Companion_Default___.ReleaseBound(currentTxID, hasReader, minActiveReaderTxID)
+}
+
+func (dafnyFreelistCore) ComputeFreelistPageCount(initialAllLen, freeCount, localFreeLen, perPage int) int {
+	return GroundKVFreelist.Companion_Default___.ComputeFreelistPageCount(
+		_dafny.IntOfInt64(int64(initialAllLen)),
+		_dafny.IntOfInt64(int64(freeCount)),
+		_dafny.IntOfInt64(int64(localFreeLen)),
+		_dafny.IntOfInt64(int64(perPage)),
+	).Int()
+}
+
+func (dafnyFreelistCore) NewFreelist() engine.FreelistPool {
+	return &dafnyFreelist{state: GroundKVFreelist.Companion_Default___.EmptyFreelist()}
+}
+
+// --- dafnyFreelist: engine.FreelistPool backed by GroundKVFreelist.FreelistState ---
+
+type dafnyFreelist struct {
+	state GroundKVFreelist.FreelistState
+}
+
+func (fl *dafnyFreelist) FreeCount() int {
+	return fl.state.Dtor_free().Cardinality().Int()
+}
+
+func (fl *dafnyFreelist) AddPending(txid uint64, ids []engine.PageID) {
+	if len(ids) == 0 {
+		return
+	}
+	fl.state = GroundKVFreelist.Companion_Default___.AddPending(fl.state, txid, toDafnyPageIDSet(ids))
+}
+
+func (fl *dafnyFreelist) Release(maxSafeTxID uint64) {
+	fl.state = GroundKVFreelist.Companion_Default___.ReleaseEligible(fl.state, maxSafeTxID)
+}
+
+func (fl *dafnyFreelist) Pop() (engine.PageID, bool) {
 	freeSet := fl.state.Dtor_free()
 	if freeSet.Cardinality().Int() == 0 {
 		return 0, false
@@ -64,22 +135,22 @@ func (fl *freelist) pop() (PageID, bool) {
 		freeSet.Difference(_dafny.SetOf(lowest)),
 		fl.state.Dtor_pending(),
 	)
-	return PageID(lowest), true
+	return engine.PageID(lowest), true
 }
 
-func (fl *freelist) returnToFree(ids []PageID) {
+func (fl *dafnyFreelist) ReturnToFree(ids []engine.PageID) {
 	if len(ids) == 0 {
 		return
 	}
 	fl.state = GroundKVFreelist.Companion_Default___.ReturnToFree(fl.state, toDafnyPageIDSet(ids))
 }
 
-func (fl *freelist) freeIDs() []PageID {
+func (fl *dafnyFreelist) FreeIDs() []engine.PageID {
 	seq := setToDafnyPageIDSeq(fl.state.Dtor_free())
 	return fromDafnyPageIDs(GroundKVFreelist.Companion_Default___.SortDedupPageIDs(seq))
 }
 
-func (fl *freelist) pendingTxIDs() []uint64 {
+func (fl *dafnyFreelist) PendingTxIDs() []uint64 {
 	pending := fl.state.Dtor_pending()
 	var items []interface{}
 	for iter := _dafny.Iterate(pending.Keys().Elements()); ; {
@@ -104,7 +175,7 @@ func (fl *freelist) pendingTxIDs() []uint64 {
 	return out
 }
 
-func (fl *freelist) snapshotAllIDs(extraIDs []PageID) []PageID {
+func (fl *dafnyFreelist) SnapshotAllIDs(extraIDs []engine.PageID) []engine.PageID {
 	var items []interface{}
 	for iter := _dafny.Iterate(fl.state.Dtor_free().Elements()); ; {
 		v, ok := iter()
@@ -133,67 +204,7 @@ func (fl *freelist) snapshotAllIDs(extraIDs []PageID) []PageID {
 		}
 	}
 	if len(items) == 0 {
-		return []PageID{}
+		return []engine.PageID{}
 	}
 	return fromDafnyPageIDs(GroundKVFreelist.Companion_Default___.SortDedupPageIDs(_dafny.SeqOf(items...)))
-}
-
-func maxFreelistIDsPerPage(pageSize int) int {
-	return GroundKVCodec.Companion_Default___.MaxFreelistIDsPerPage(uint32(pageSize)).Int()
-}
-
-func encodeFreelistPage(pageSize int, pgid PageID, txid uint64, next PageID, ids []PageID) ([]byte, error) {
-	res := GroundKVCodec.Companion_Default___.EncodeFreelistPage(
-		uint32(pageSize),
-		uint64(pgid),
-		txid,
-		uint64(next),
-		toDafnyPageIDs(ids),
-	)
-	if res.Is_Err() {
-		return nil, fmt.Errorf("%w: too many freelist IDs (%d) for page size %d",
-			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), len(ids), pageSize)
-	}
-	buf := _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence))
-	stampPageChecksum(buf)
-	return buf, nil
-}
-
-func decodeFreelistPage(buf []byte, h pageHeader) (next PageID, ids []PageID, err error) {
-	res := GroundKVCodec.Companion_Default___.DecodeFreelistPage(
-		_dafny.SeqOfBytes(buf),
-		toDafnyHeader(h),
-	)
-	if res.Is_Err() {
-		return 0, nil, fmt.Errorf("%w: freelist decode failed (flags %d)",
-			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.flags)
-	}
-	dec := res.Dtor_value().(GroundKVCodec.DecodedFreelist)
-	return PageID(dec.Dtor_next()), fromDafnyPageIDs(dec.Dtor_ids()), nil
-}
-
-func (db *DB) readFreelistChainLocked(headPGID PageID) (freedIDs []PageID, chainPages []PageID, err error) {
-	if headPGID == 0 {
-		return nil, nil, nil
-	}
-	visited := make(map[PageID]bool)
-	curr := headPGID
-	for curr != 0 {
-		if visited[curr] {
-			return nil, nil, fmt.Errorf("%w: cycle in freelist chain at pgid %d", engine.ErrCorruptedPage, curr)
-		}
-		visited[curr] = true
-		buf, h, err := db.readCommittedPageLocked(curr)
-		if err != nil {
-			return nil, nil, err
-		}
-		next, ids, err := decodeFreelistPage(buf, h)
-		if err != nil {
-			return nil, nil, err
-		}
-		chainPages = append(chainPages, curr)
-		freedIDs = append(freedIDs, ids...)
-		curr = next
-	}
-	return freedIDs, chainPages, nil
 }

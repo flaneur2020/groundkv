@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/flaneur2020/groundkv/dst"
+	"github.com/flaneur2020/groundkv/verify/dst"
 )
 
 func main() {
@@ -24,7 +24,7 @@ func main() {
 		res, err := dst.RunSimulation(seed, *steps)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Reproduce with: go test -v ./dst -run TestDSTReplay -dst-seed=%d -dst-steps=%d\n", seed, *steps)
+			fmt.Fprintf(os.Stderr, "Reproduce with: go test -v ./verify/dst -run TestDSTReplay -dst-seed=%d -dst-steps=%d\n", seed, *steps)
 			os.Exit(1)
 		}
 		agg.Merge(res.Coverage)

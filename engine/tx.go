@@ -6,14 +6,34 @@ import (
 	"sort"
 )
 
-type txCommitPhase uint8
+// CommitPhase identifies the stage of a 4-phase write transaction.
+type CommitPhase uint8
 
 const (
-	txPhaseActive txCommitPhase = iota
-	txPhaseDataWritten
-	txPhaseDataSynced
-	txPhaseMetaWritten
+	CommitPhaseIdle CommitPhase = iota
+	CommitPhaseActive
+	CommitPhaseDataWritten
+	CommitPhaseDataSynced
+	CommitPhaseMetaWritten
 )
+
+// CommitCore abstracts the 4-phase commit state-machine transition guards.
+type CommitCore interface {
+	ValidNextPhase(current, next CommitPhase) bool
+}
+
+// --- Pure-Go CommitCore implementation ---
+
+type goCommitCore struct{}
+
+func (goCommitCore) ValidNextPhase(current, next CommitPhase) bool {
+	return (current == CommitPhaseIdle && next == CommitPhaseActive) ||
+		(current == CommitPhaseActive && next == CommitPhaseDataWritten) ||
+		(current == CommitPhaseDataWritten && next == CommitPhaseDataSynced) ||
+		(current == CommitPhaseDataSynced && next == CommitPhaseMetaWritten) ||
+		(current == CommitPhaseMetaWritten && next == CommitPhaseIdle) ||
+		(current != CommitPhaseIdle && next == CommitPhaseIdle)
+}
 
 // Tx represents either a read-only MVCC snapshot transaction or a single-writer
 // copy-on-write transaction.
@@ -21,7 +41,7 @@ type Tx struct {
 	db       *DB
 	writable bool
 	closed   bool
-	phase    txCommitPhase
+	phase    CommitPhase
 
 	// meta is a private copy pinned when the transaction begins. For a write
 	// transaction, meta.Root, meta.Freelist, and meta.HighWater advance in memory
@@ -67,13 +87,13 @@ func (tx *Tx) CommitPhase() string {
 		return "IDLE"
 	}
 	switch tx.phase {
-	case txPhaseActive:
+	case CommitPhaseActive:
 		return "STAGED"
-	case txPhaseDataWritten:
+	case CommitPhaseDataWritten:
 		return "DATA_WRITTEN"
-	case txPhaseDataSynced:
+	case CommitPhaseDataSynced:
 		return "DATA_SYNCED"
-	case txPhaseMetaWritten:
+	case CommitPhaseMetaWritten:
 		return "META_WRITTEN"
 	default:
 		return "IDLE"
@@ -136,7 +156,7 @@ func (tx *Tx) Put(key, value []byte) error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseActive {
+	if tx.phase != CommitPhaseActive {
 		return errors.New("groundkv: cannot mutate transaction after commit has started")
 	}
 	newRoot, err := btreePut(tx, tx.meta.Root, key, value)
@@ -156,7 +176,7 @@ func (tx *Tx) Delete(key []byte) error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseActive {
+	if tx.phase != CommitPhaseActive {
 		return errors.New("groundkv: cannot mutate transaction after commit has started")
 	}
 	newRoot, _, err := btreeDelete(tx, tx.meta.Root, key)
@@ -206,7 +226,7 @@ func (tx *Tx) WriteDataPages() error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseActive {
+	if !tx.db.core.ValidNextPhase(tx.phase, CommitPhaseDataWritten) {
 		return errors.New("groundkv: WriteDataPages called out of order")
 	}
 
@@ -231,7 +251,7 @@ func (tx *Tx) WriteDataPages() error {
 			}
 		}
 	}
-	tx.phase = txPhaseDataWritten
+	tx.phase = CommitPhaseDataWritten
 	if tx.db.opts.Tracer != nil {
 		tx.db.mu.RLock()
 		tx.db.emitTraceLocked("WriteDataPages")
@@ -248,8 +268,8 @@ func (tx *Tx) prepareFreelistPages() error {
 			tx.freed[oldID] = struct{}{}
 		}
 	}
-	freeCount := len(tx.db.freelist.free)
-	initialAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
+	freeCount := tx.db.freelist.FreeCount()
+	initialAll := tx.db.freelist.SnapshotAllIDs(tx.freedSlice())
 	tx.db.mu.Unlock()
 
 	if len(initialAll)+len(tx.localFree) == 0 {
@@ -258,31 +278,12 @@ func (tx *Tx) prepareFreelistPages() error {
 		return nil
 	}
 
-	perPage := maxFreelistIDsPerPage(tx.pageSize())
+	perPage := tx.db.core.MaxFreelistIDsPerPage(tx.pageSize())
 	if tx.db.opts.MaxFreelistIDs > 0 && tx.db.opts.MaxFreelistIDs < perPage {
 		perPage = tx.db.opts.MaxFreelistIDs
 	}
 
-	// Compute the exact minimal number of freelist pages C accounting for the
-	// fact that allocating C pages pops up to min(C, reusable) IDs out of
-	// tx.localFree and db.freelist.free, shrinking the remaining list to
-	// nonReusable + max(0, reusable - C):
-	//   - If C <= reusable: need perPage*C >= total - C    => C >= ceil(total / (perPage + 1))
-	//   - If C >  reusable: need perPage*C >= nonReusable  => C >= ceil(nonReusable / perPage)
-	total := len(initialAll) + len(tx.localFree)
-	nonReusable := len(initialAll) - freeCount
-	if nonReusable < 0 {
-		nonReusable = 0
-	}
-	numPages := (total + perPage) / (perPage + 1)
-	if nonReusable > 0 {
-		if minForNonReusable := (nonReusable + perPage - 1) / perPage; minForNonReusable > numPages {
-			numPages = minForNonReusable
-		}
-	}
-	if numPages < 1 {
-		numPages = 1
-	}
+	numPages := tx.db.core.ComputeFreelistPageCount(len(initialAll), freeCount, len(tx.localFree), perPage)
 
 	chainIDs := make([]PageID, numPages)
 	for i := 0; i < numPages; i++ {
@@ -299,7 +300,7 @@ func (tx *Tx) prepareFreelistPages() error {
 	// Recompute after allocating chainIDs (popping from localFree/free shrinks
 	// the list so it always fits in numPages and never includes any live chainID).
 	tx.db.mu.Lock()
-	finalAll := tx.db.freelist.snapshotAllIDs(tx.freedSlice())
+	finalAll := tx.db.freelist.SnapshotAllIDs(tx.freedSlice())
 	tx.db.mu.Unlock()
 
 	for i, pgid := range chainIDs {
@@ -316,7 +317,7 @@ func (tx *Tx) prepareFreelistPages() error {
 		if i+1 < len(chainIDs) {
 			next = chainIDs[i+1]
 		}
-		buf, err := encodeFreelistPage(tx.pageSize(), pgid, tx.txid(), next, chunk)
+		buf, err := encodeFreelistPageWithCore(tx.db.core, tx.pageSize(), pgid, tx.txid(), next, chunk)
 		if err != nil {
 			return err
 		}
@@ -337,7 +338,7 @@ func (tx *Tx) SyncDataPages() error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseDataWritten {
+	if !tx.db.core.ValidNextPhase(tx.phase, CommitPhaseDataSynced) {
 		return errors.New("groundkv: SyncDataPages called out of order")
 	}
 
@@ -349,7 +350,7 @@ func (tx *Tx) SyncDataPages() error {
 		// meta slot because both SyncMetaPage and rollback's invalidation write
 		// failed. Neutralize that slot BEFORE calling file-wide storage.Sync()
 		// so fsync cannot resurrect the rolled-back transaction.
-		slot := metaSlot(tx.meta.TxID + 1)
+		slot := tx.db.core.MetaSlot(tx.meta.TxID + 1)
 		zeros := make([]byte, tx.db.opts.PageSize)
 		if _, err := tx.db.storage.WriteAt(zeros, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
 			return fmt.Errorf("groundkv: clear dirty alt meta %d: %w", slot, err)
@@ -364,7 +365,7 @@ func (tx *Tx) SyncDataPages() error {
 			return fmt.Errorf("groundkv: sync data pages: %w", err)
 		}
 	}
-	tx.phase = txPhaseDataSynced
+	tx.phase = CommitPhaseDataSynced
 	if tx.db.opts.Tracer != nil {
 		tx.db.mu.RLock()
 		tx.db.emitTraceLocked("SyncDataPages")
@@ -382,19 +383,19 @@ func (tx *Tx) WriteMetaPage() error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseDataSynced {
+	if !tx.db.core.ValidNextPhase(tx.phase, CommitPhaseMetaWritten) {
 		return errors.New("groundkv: WriteMetaPage called out of order")
 	}
 
 	nextMeta := tx.meta
 	nextMeta.TxID++
-	slot := metaSlot(nextMeta.TxID)
-	metaBuf := encodeMetaPage(tx.db.opts.PageSize, slot, nextMeta)
+	slot := tx.db.core.MetaSlot(nextMeta.TxID)
+	metaBuf := encodeMetaPageWithCore(tx.db.core, tx.db.opts.PageSize, slot, nextMeta)
 	if _, err := tx.db.storage.WriteAt(metaBuf, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
 		return fmt.Errorf("groundkv: write meta page %d: %w", slot, err)
 	}
 	tx.nextMeta = nextMeta
-	tx.phase = txPhaseMetaWritten
+	tx.phase = CommitPhaseMetaWritten
 	if tx.db.opts.Tracer != nil {
 		tx.db.mu.RLock()
 		tx.db.emitTraceLocked("WriteMetaPage")
@@ -413,11 +414,11 @@ func (tx *Tx) SyncMetaPage() error {
 	if !tx.writable {
 		return ErrTxReadOnly
 	}
-	if tx.phase != txPhaseMetaWritten {
+	if !tx.db.core.ValidNextPhase(tx.phase, CommitPhaseIdle) || tx.phase != CommitPhaseMetaWritten {
 		return errors.New("groundkv: SyncMetaPage called out of order")
 	}
 
-	slot := metaSlot(tx.nextMeta.TxID)
+	slot := tx.db.core.MetaSlot(tx.nextMeta.TxID)
 	if !tx.db.opts.NoSync {
 		if err := tx.db.storage.Sync(); err != nil {
 			return fmt.Errorf("groundkv: sync meta page %d: %w", slot, err)
@@ -429,10 +430,10 @@ func (tx *Tx) SyncMetaPage() error {
 	tx.db.mu.Lock()
 	tx.db.meta = tx.nextMeta
 	if !tx.db.opts.NoFreelist {
-		tx.db.freelist.addPending(tx.nextMeta.TxID, freedList)
-		tx.db.freelist.reclaimedRuns += uint64(len(tx.recycled))
+		tx.db.freelist.AddPending(tx.nextMeta.TxID, freedList)
+		tx.db.reclaimedRuns += uint64(len(tx.recycled))
 		tx.db.freelistPages = tx.newFreelistPages
-		tx.db.freelist.release(tx.db.releaseBoundLocked())
+		tx.db.freelist.Release(tx.db.releaseBoundLocked())
 	}
 	tx.db.writeTx = nil
 	tx.db.emitTraceLocked("SyncMetaPage")
@@ -458,13 +459,13 @@ func (tx *Tx) Rollback() error {
 	tx.closed = true
 
 	var altMetaDirty bool
-	if tx.writable && tx.phase >= txPhaseMetaWritten {
+	if tx.writable && tx.phase >= CommitPhaseMetaWritten {
 		// WriteMetaPage already wrote nextMeta into the alternate meta slot in
 		// the OS page cache before SyncMetaPage failed. Overwrite that slot with
 		// an invalid (zeroed) page so a subsequent transaction's file-wide
 		// SyncDataPages() fsync cannot resurrect this rolled-back transaction.
 		// The active committed slot (db.meta.TxID % 2) remains durable and untouched.
-		slot := metaSlot(tx.nextMeta.TxID)
+		slot := tx.db.core.MetaSlot(tx.nextMeta.TxID)
 		zeros := make([]byte, tx.db.opts.PageSize)
 		if _, err := tx.db.storage.WriteAt(zeros, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
 			altMetaDirty = true
@@ -481,11 +482,11 @@ func (tx *Tx) Rollback() error {
 		return nil
 	}
 	if tx.writable {
-		if tx.phase >= txPhaseMetaWritten {
+		if tx.phase >= CommitPhaseMetaWritten {
 			tx.db.dirtyAltMeta = altMetaDirty
 		}
 		if !tx.db.opts.NoFreelist {
-			if tx.phase >= txPhaseMetaWritten {
+			if tx.phase >= CommitPhaseMetaWritten {
 				// Advance HighWater past any pages written for nextMeta and hold
 				// all of them (both recycled and newly allocated) in
 				// pending[nextMeta.TxID] until a subsequent commit rotates past
@@ -497,9 +498,9 @@ func (tx *Tx) Rollback() error {
 					}
 					tx.db.meta.HighWater = tx.nextMeta.HighWater
 				}
-				tx.db.freelist.addPending(tx.nextMeta.TxID, held)
+				tx.db.freelist.AddPending(tx.nextMeta.TxID, held)
 			} else if len(tx.recycled) > 0 {
-				tx.db.freelist.returnToFree(tx.recycled)
+				tx.db.freelist.ReturnToFree(tx.recycled)
 			}
 		}
 		if tx.db.writeTx == tx {
@@ -513,7 +514,7 @@ func (tx *Tx) Rollback() error {
 			tx.db.readerCounts[tx.meta.TxID] = c - 1
 		}
 		if !tx.db.opts.NoFreelist {
-			tx.db.freelist.release(tx.db.releaseBoundLocked())
+			tx.db.freelist.Release(tx.db.releaseBoundLocked())
 		}
 		tx.db.emitTraceLocked("CloseRead")
 	}
@@ -540,15 +541,16 @@ func (tx *Tx) freedSlice() []PageID {
 
 // --- pageAccess implementation ---
 
+func (tx *Tx) core() Core         { return tx.db.core }
 func (tx *Tx) pageSize() int      { return tx.db.opts.PageSize }
 func (tx *Tx) maxLeafKeys() int   { return tx.db.opts.MaxLeafKeys }
 func (tx *Tx) maxBranchKeys() int { return tx.db.opts.MaxBranchKeys }
 func (tx *Tx) txid() uint64       { return tx.meta.TxID + 1 }
 
-func (tx *Tx) readPage(pgid PageID) ([]byte, pageHeader, error) {
+func (tx *Tx) readPage(pgid PageID) ([]byte, PageHeader, error) {
 	if tx.dirty != nil {
 		if buf, ok := tx.dirty[pgid]; ok {
-			h, err := readAndVerifyPageHeader(buf, pgid)
+			h, err := readAndVerifyPageHeaderWithCore(tx.db.core, buf, pgid)
 			return buf, h, err
 		}
 	}
@@ -564,7 +566,7 @@ func (tx *Tx) allocPageID() PageID {
 	}
 	if !tx.db.opts.NoFreelist {
 		tx.db.mu.Lock()
-		pgid, ok := tx.db.freelist.pop()
+		pgid, ok := tx.db.freelist.Pop()
 		tx.db.mu.Unlock()
 		if ok {
 			tx.recycled = append(tx.recycled, pgid)

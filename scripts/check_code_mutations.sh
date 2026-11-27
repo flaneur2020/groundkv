@@ -12,9 +12,10 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 setup_copy() {
   local dest="$1"
-  mkdir -p "$dest"
+  mkdir -p "$dest/verify"
   cp "$ROOT_DIR/go.mod" "$ROOT_DIR/go.sum" "$dest/"
-  cp -r "$ROOT_DIR/engine" "$ROOT_DIR/dst" "$dest/"
+  cp -r "$ROOT_DIR/engine" "$dest/"
+  cp -r "$ROOT_DIR/verify/dst" "$dest/verify/"
 }
 
 run_code_mutation() {
@@ -57,43 +58,43 @@ run_code_mutation \
 run_code_mutation \
   "ignore-mvcc-reader-watermark" \
   "engine/db.go" \
-  '	if minR, ok := db.minActiveReaderTxIDLocked(); ok && minR < bound {
-		bound = minR
-	}' \
-  '	// MUTATED: MVCC reader watermark ignored' \
+  '	minR, hasReader := db.minActiveReaderTxIDLocked()
+	return db.core.ReleaseBound(db.meta.TxID, hasReader, minR)' \
+  '	// MUTATED: MVCC reader watermark ignored
+	return db.core.ReleaseBound(db.meta.TxID, false, 0)' \
   "go test ./engine -run '^TestFreelistReclamationAndMVCCReaderBarrier$'"
 
 # Code Mutation 3: Omit alternate meta slot neutralization on Rollback after failed SyncMetaPage
 run_code_mutation \
   "omit-rollback-alt-meta-neutralize" \
   "engine/tx.go" \
-  '	if tx.writable && tx.phase >= txPhaseMetaWritten {
+  '	if tx.writable && tx.phase >= CommitPhaseMetaWritten {
 		// WriteMetaPage already wrote nextMeta into the alternate meta slot in
 		// the OS page cache before SyncMetaPage failed. Overwrite that slot with
 		// an invalid (zeroed) page so a subsequent transaction'\''s file-wide
 		// SyncDataPages() fsync cannot resurrect this rolled-back transaction.
 		// The active committed slot (db.meta.TxID % 2) remains durable and untouched.
-		slot := metaSlot(tx.nextMeta.TxID)
+		slot := tx.db.core.MetaSlot(tx.nextMeta.TxID)
 		zeros := make([]byte, tx.db.opts.PageSize)
 		if _, err := tx.db.storage.WriteAt(zeros, int64(slot)*int64(tx.db.opts.PageSize)); err != nil {
 			altMetaDirty = true
 		}
 	}' \
   '	// MUTATED: alt-meta neutralization on Rollback omitted' \
-  "go test ./dst -run '^TestDSTSwarm$' -dst-seeds=14 -dst-steps=200"
+  "go test ./verify/dst -run '^TestDSTSwarm$' -dst-seeds=14 -dst-steps=200"
 
 # Code Mutation 4: Replace byte-aware splitLeafEntries with naive midpoint split
 run_code_mutation \
   "midpoint-only-leaf-split" \
   "engine/btree.go" \
-  'func splitLeafEntries(entries []leafEntry, pageSize, maxKeys int) [][]leafEntry {
+  'func splitLeafEntries(entries []LeafEntry, pageSize, maxKeys int) [][]LeafEntry {
 	bestMid := -1' \
-  'func splitLeafEntries(entries []leafEntry, pageSize, maxKeys int) [][]leafEntry {
+  'func splitLeafEntries(entries []LeafEntry, pageSize, maxKeys int) [][]LeafEntry {
 	if len(entries) >= 2 {
 		mid := len(entries) / 2
-		return [][]leafEntry{entries[:mid], entries[mid:]}
+		return [][]LeafEntry{entries[:mid], entries[mid:]}
 	}
 	bestMid := -1' \
-  "go test ./dst -run '^TestDSTSwarm$' -dst-seeds=14 -dst-steps=200"
+  "go test ./verify/dst -run '^TestDSTSwarm$' -dst-seeds=14 -dst-steps=200"
 
 echo "==> All 4 Go engine code mutation checks passed!"

@@ -1126,6 +1126,102 @@ module GroundKVBTree {
     MapUnionPutHelper(mLeft, mMid, mRight, key, value);
   }
 
+  // Allocates one COW BranchPage per chunk and proves ValidPutResults + exact BranchInterp.
+  method AllocBranchChunks(
+    store: PageStore,
+    nextID: PageID,
+    chunks: seq<seq<BranchEntry>>,
+    ghost childHeight: nat,
+    ghost lo: Option<Bytes>,
+    ghost hi: Option<Bytes>,
+    pageSize: uint32
+  ) returns (
+    ok: bool,
+    newStore: PageStore,
+    newNextID: PageID,
+    results: seq<BranchEntry>
+  )
+    requires StoreBoundedBy(store, nextID)
+    requires 2 <= nextID
+    requires StoreValidPageSizes(store, pageSize)
+    requires |chunks| >= 1
+    requires forall i | 0 <= i < |chunks| :: |chunks[i]| >= 1
+    requires ValidPutResults(store, FlattenBranch(chunks), childHeight, lo, hi)
+    requires forall i | 0 <= i < |FlattenBranch(chunks)| :: 24 + 12 + |FlattenBranch(chunks)[i].key| <= pageSize as nat
+    ensures ok ==>
+      StoreExtends(store, newStore) &&
+      StoreBoundedBy(newStore, newNextID) &&
+      StoreValidPageSizes(newStore, pageSize) &&
+      nextID <= newNextID &&
+      |results| == |chunks| &&
+      ValidPutResults(newStore, results, childHeight + 1, lo, hi) &&
+      (forall i | 0 <= i < |results| :: 24 + 12 + |results[i].key| <= pageSize as nat) &&
+      BranchInterp(newStore, results, childHeight + 1) == BranchInterp(store, FlattenBranch(chunks), childHeight)
+  {
+    var flat := FlattenBranch(chunks);
+    BranchChunksOrderLemma(store, chunks, childHeight, lo, hi);
+
+    newStore := store;
+    newNextID := nextID;
+    results := [];
+    var i: nat := 0;
+    while i < |chunks|
+      invariant i <= |chunks|
+      invariant |results| == i
+      invariant StoreExtends(store, newStore)
+      invariant StoreBoundedBy(newStore, newNextID)
+      invariant StoreValidPageSizes(newStore, pageSize)
+      invariant nextID <= newNextID
+      invariant forall j | 0 <= j < i ::
+        results[j].key == chunks[j][0].key &&
+        results[j].child in newStore &&
+        newStore[results[j].child] == BranchPage(chunks[j]) &&
+        24 + 12 + |results[j].key| <= pageSize as nat
+    {
+      if newNextID == 0xFFFF_FFFF_FFFF_FFFF {
+        return false, store, nextID, [];
+      }
+      var c := chunks[i];
+      assert ValidPageEntries(BranchPage(c), pageSize) by {
+        forall k | 0 <= k < |c|
+          ensures 24 + 12 + |c[k].key| <= pageSize as nat
+        {
+          FlattenBranchPos(chunks, i, k);
+          assert flat[FlattenBranchOffset(chunks, i) + k] == c[k];
+        }
+      }
+      var cid := newNextID;
+      newNextID := cid + 1;
+      newStore := newStore[cid := BranchPage(c)];
+      results := results + [BranchEntry(c[0].key, cid)];
+      i := i + 1;
+    }
+
+    forall j | 0 <= j < |results|
+      ensures ValidTree(newStore, results[j].child, childHeight + 1, ChildLo(results, j, lo), ChildHi(results, j, hi))
+    {
+      var c := chunks[j];
+      var cLoJ := ChildLo(results, j, lo);
+      var cHiJ := ChildHi(results, j, hi);
+      assert cLoJ == ChunkLo(chunks, j, lo);
+      assert cHiJ == ChunkHi(chunks, j, hi);
+      assert ValidPutResults(store, chunks[j], childHeight, ChunkLo(chunks, j, lo), ChunkHi(chunks, j, hi));
+      forall k | 0 <= k < |c|
+        ensures ValidTree(newStore, c[k].child, childHeight, ChildLo(c, k, cLoJ), ChildHi(c, k, cHiJ))
+      {
+        ValidTreePreserved(store, newStore, c[k].child, childHeight, ChildLo(c, k, cLoJ), ChildHi(c, k, cHiJ));
+      }
+    }
+    forall idx | 0 <= idx < |flat|
+      ensures TreeInterp(newStore, flat[idx].child, childHeight) == TreeInterp(store, flat[idx].child, childHeight)
+    {
+      ValidTreePreserved(store, newStore, flat[idx].child, childHeight, ChildLo(flat, idx, lo), ChildHi(flat, idx, hi));
+    }
+    BranchChunksInterpLemma(newStore, chunks, results, childHeight);
+    BranchInterpPreserved(store, newStore, flat, childHeight);
+    ok := true;
+  }
+
   // Recursive COW B+Tree Put on a subtree of height `height`.
   method {:vcs_split_on_every_assert} TreePutNode(
     store: PageStore,
@@ -1261,68 +1357,9 @@ module GroundKVBTree {
           finalChunks := SplitBranchEntries(updated, pageSize, maxBranchKeys);
         }
 
-        BranchChunksOrderLemma(st1, finalChunks, height - 1, lo, hi);
-
-        newStore := st1;
-        newNextID := nid1;
-        results := [];
-        var i: nat := 0;
-        while i < |finalChunks|
-          invariant i <= |finalChunks|
-          invariant |results| == i
-          invariant StoreExtends(st1, newStore)
-          invariant StoreBoundedBy(newStore, newNextID)
-          invariant StoreValidPageSizes(newStore, pageSize)
-          invariant nid1 <= newNextID
-          invariant forall j | 0 <= j < i ::
-            results[j].key == finalChunks[j][0].key &&
-            results[j].child in newStore &&
-            newStore[results[j].child] == BranchPage(finalChunks[j]) &&
-            24 + 12 + |results[j].key| <= pageSize as nat
-        {
-          if newNextID == 0xFFFF_FFFF_FFFF_FFFF {
-            return false, store, nextID, [];
-          }
-          var c := finalChunks[i];
-          assert ValidPageEntries(BranchPage(c), pageSize) by {
-            forall k | 0 <= k < |c|
-              ensures 24 + 12 + |c[k].key| <= pageSize as nat
-            {
-              FlattenBranchPos(finalChunks, i, k);
-              assert updated[FlattenBranchOffset(finalChunks, i) + k] == c[k];
-            }
-          }
-          var cid := newNextID;
-          newNextID := cid + 1;
-          newStore := newStore[cid := BranchPage(c)];
-          results := results + [BranchEntry(c[0].key, cid)];
-          i := i + 1;
-        }
-
-        // Prove ValidPutResults(newStore, results, height, lo, hi)
-        forall j | 0 <= j < |results|
-          ensures ValidTree(newStore, results[j].child, height, ChildLo(results, j, lo), ChildHi(results, j, hi))
-        {
-          var c := finalChunks[j];
-          var cLoJ := ChildLo(results, j, lo);
-          var cHiJ := ChildHi(results, j, hi);
-          assert cLoJ == ChunkLo(finalChunks, j, lo);
-          assert cHiJ == ChunkHi(finalChunks, j, hi);
-          assert ValidPutResults(st1, finalChunks[j], height - 1, ChunkLo(finalChunks, j, lo), ChunkHi(finalChunks, j, hi));
-          forall k | 0 <= k < |c|
-            ensures ValidTree(newStore, c[k].child, height - 1, ChildLo(c, k, cLoJ), ChildHi(c, k, cHiJ))
-          {
-            ValidTreePreserved(st1, newStore, c[k].child, height - 1, ChildLo(c, k, cLoJ), ChildHi(c, k, cHiJ));
-          }
-        }
-        forall i | 0 <= i < |updated|
-          ensures TreeInterp(newStore, updated[i].child, height - 1) == TreeInterp(st1, updated[i].child, height - 1)
-        {
-          ValidTreePreserved(st1, newStore, updated[i].child, height - 1, ChildLo(updated, i, lo), ChildHi(updated, i, hi));
-        }
-        BranchChunksInterpLemma(newStore, finalChunks, results, height - 1);
-        BranchInterpPreserved(st1, newStore, updated, height - 1);
-        ok := true;
+        ok, newStore, newNextID, results := AllocBranchChunks(
+          st1, nid1, finalChunks, height - 1, lo, hi, pageSize
+        );
   }
 
   // Top-level COW B+Tree Put (handles empty tree creation and root promotion loop).

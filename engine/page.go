@@ -30,104 +30,162 @@ const (
 	branchEntryHeaderSize = 12
 )
 
-type pageHeader struct {
-	pgid     PageID
-	flags    uint16
-	count    uint16
-	checksum uint32
-	txid     uint64
+// PageHeader holds the decoded 24-byte fixed on-disk page header.
+type PageHeader struct {
+	PGID     PageID
+	Flags    uint16
+	Count    uint16
+	Checksum uint32
+	TxID     uint64
 }
 
-type leafEntry struct {
-	key   []byte
-	value []byte
+// LeafEntry is a single key-value entry stored in a B+Tree leaf page.
+type LeafEntry struct {
+	Key   []byte
+	Value []byte
 }
 
-type branchEntry struct {
-	key   []byte
-	child PageID
+// BranchEntry is a separator key and child PageID stored in a B+Tree branch page.
+type BranchEntry struct {
+	Key   []byte
+	Child PageID
 }
 
-func writePageHeader(buf []byte, h pageHeader) {
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(h.pgid))
-	binary.LittleEndian.PutUint16(buf[8:10], h.flags)
-	binary.LittleEndian.PutUint16(buf[10:12], h.count)
+// PageCodec abstracts fixed page header and B+Tree leaf/branch binary codecs.
+type PageCodec interface {
+	EncodePageHeader(h PageHeader) []byte
+	DecodePageHeader(buf []byte) (PageHeader, error)
+
+	LeafEncodedSize(entries []LeafEntry) int
+	EncodeLeafPage(pageSize int, pgid PageID, txid uint64, entries []LeafEntry) ([]byte, error)
+	DecodeLeafPage(buf []byte, h PageHeader) ([]LeafEntry, error)
+
+	BranchEncodedSize(entries []BranchEntry) int
+	EncodeBranchPage(pageSize int, pgid PageID, txid uint64, entries []BranchEntry) ([]byte, error)
+	DecodeBranchPage(buf []byte, h PageHeader) ([]BranchEntry, error)
+}
+
+// StampPageChecksum computes the CRC32-IEEE checksum over buf (with header
+// bytes [12:16] zeroed) and writes it into buf[12:16].
+func StampPageChecksum(buf []byte) {
 	binary.LittleEndian.PutUint32(buf[12:16], 0)
-	binary.LittleEndian.PutUint64(buf[16:24], h.txid)
 	sum := crc32.ChecksumIEEE(buf)
 	binary.LittleEndian.PutUint32(buf[12:16], sum)
 }
 
-func readAndVerifyPageHeader(buf []byte, expectedPGID PageID) (pageHeader, error) {
-	if len(buf) < pageHeaderSize {
-		return pageHeader{}, ErrCorruptedPage
+func readAndVerifyPageHeaderWithCore(c PageCodec, buf []byte, expectedPGID PageID) (PageHeader, error) {
+	h, err := c.DecodePageHeader(buf)
+	if err != nil {
+		return PageHeader{}, err
 	}
-	h := pageHeader{
-		pgid:     PageID(binary.LittleEndian.Uint64(buf[0:8])),
-		flags:    binary.LittleEndian.Uint16(buf[8:10]),
-		count:    binary.LittleEndian.Uint16(buf[10:12]),
-		checksum: binary.LittleEndian.Uint32(buf[12:16]),
-		txid:     binary.LittleEndian.Uint64(buf[16:24]),
-	}
-	if h.pgid != expectedPGID {
-		return pageHeader{}, fmt.Errorf("%w: expected pgid %d, got %d", ErrCorruptedPage, expectedPGID, h.pgid)
+	if h.PGID != expectedPGID {
+		return PageHeader{}, fmt.Errorf("%w: expected pgid %d, got %d", ErrCorruptedPage, expectedPGID, h.PGID)
 	}
 	tmp := make([]byte, len(buf))
 	copy(tmp, buf)
 	binary.LittleEndian.PutUint32(tmp[12:16], 0)
-	if crc32.ChecksumIEEE(tmp) != h.checksum {
-		return pageHeader{}, fmt.Errorf("%w: checksum mismatch on pgid %d", ErrCorruptedPage, expectedPGID)
+	if crc32.ChecksumIEEE(tmp) != h.Checksum {
+		return PageHeader{}, fmt.Errorf("%w: checksum mismatch on pgid %d", ErrCorruptedPage, expectedPGID)
 	}
 	return h, nil
 }
 
-func leafEncodedSize(entries []leafEntry) int {
+func encodeLeafPageWithCore(c PageCodec, pageSize int, pgid PageID, txid uint64, entries []LeafEntry) ([]byte, error) {
+	buf, err := c.EncodeLeafPage(pageSize, pgid, txid, entries)
+	if err != nil {
+		return nil, err
+	}
+	StampPageChecksum(buf)
+	return buf, nil
+}
+
+func encodeBranchPageWithCore(c PageCodec, pageSize int, pgid PageID, txid uint64, entries []BranchEntry) ([]byte, error) {
+	buf, err := c.EncodeBranchPage(pageSize, pgid, txid, entries)
+	if err != nil {
+		return nil, err
+	}
+	StampPageChecksum(buf)
+	return buf, nil
+}
+
+// --- Pure-Go PageCodec implementation ---
+
+type goPageCodec struct{}
+
+func (goPageCodec) EncodePageHeader(h PageHeader) []byte {
+	buf := make([]byte, pageHeaderSize)
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(h.PGID))
+	binary.LittleEndian.PutUint16(buf[8:10], h.Flags)
+	binary.LittleEndian.PutUint16(buf[10:12], h.Count)
+	binary.LittleEndian.PutUint32(buf[12:16], h.Checksum)
+	binary.LittleEndian.PutUint64(buf[16:24], h.TxID)
+	return buf
+}
+
+func (goPageCodec) DecodePageHeader(buf []byte) (PageHeader, error) {
+	if len(buf) < pageHeaderSize {
+		return PageHeader{}, ErrCorruptedPage
+	}
+	return PageHeader{
+		PGID:     PageID(binary.LittleEndian.Uint64(buf[0:8])),
+		Flags:    binary.LittleEndian.Uint16(buf[8:10]),
+		Count:    binary.LittleEndian.Uint16(buf[10:12]),
+		Checksum: binary.LittleEndian.Uint32(buf[12:16]),
+		TxID:     binary.LittleEndian.Uint64(buf[16:24]),
+	}, nil
+}
+
+func leafEncodedSize(entries []LeafEntry) int {
 	size := pageHeaderSize
 	for _, e := range entries {
-		size += leafEntryHeaderSize + len(e.key) + len(e.value)
+		size += leafEntryHeaderSize + len(e.Key) + len(e.Value)
 	}
 	return size
 }
 
-func branchEncodedSize(entries []branchEntry) int {
+func branchEncodedSize(entries []BranchEntry) int {
 	size := pageHeaderSize
 	for _, e := range entries {
-		size += branchEntryHeaderSize + len(e.key)
+		size += branchEntryHeaderSize + len(e.Key)
 	}
 	return size
 }
 
-func encodeLeafPage(pageSize int, pgid PageID, txid uint64, entries []leafEntry) ([]byte, error) {
+func (goPageCodec) LeafEncodedSize(entries []LeafEntry) int {
+	return leafEncodedSize(entries)
+}
+
+func (c goPageCodec) EncodeLeafPage(pageSize int, pgid PageID, txid uint64, entries []LeafEntry) ([]byte, error) {
 	if leafEncodedSize(entries) > pageSize {
 		return nil, fmt.Errorf("%w: leaf entries exceed page size %d", ErrValueTooLarge, pageSize)
 	}
 	buf := make([]byte, pageSize)
 	off := pageHeaderSize
 	for _, e := range entries {
-		binary.LittleEndian.PutUint32(buf[off:off+4], uint32(len(e.key)))
-		binary.LittleEndian.PutUint32(buf[off+4:off+8], uint32(len(e.value)))
+		binary.LittleEndian.PutUint32(buf[off:off+4], uint32(len(e.Key)))
+		binary.LittleEndian.PutUint32(buf[off+4:off+8], uint32(len(e.Value)))
 		off += leafEntryHeaderSize
-		copy(buf[off:off+len(e.key)], e.key)
-		off += len(e.key)
-		copy(buf[off:off+len(e.value)], e.value)
-		off += len(e.value)
+		copy(buf[off:off+len(e.Key)], e.Key)
+		off += len(e.Key)
+		copy(buf[off:off+len(e.Value)], e.Value)
+		off += len(e.Value)
 	}
-	writePageHeader(buf, pageHeader{
-		pgid:  pgid,
-		flags: PageFlagLeaf,
-		count: uint16(len(entries)),
-		txid:  txid,
-	})
+	copy(buf[0:pageHeaderSize], c.EncodePageHeader(PageHeader{
+		PGID:  pgid,
+		Flags: PageFlagLeaf,
+		Count: uint16(len(entries)),
+		TxID:  txid,
+	}))
 	return buf, nil
 }
 
-func decodeLeafPage(buf []byte, h pageHeader) ([]leafEntry, error) {
-	if h.flags != PageFlagLeaf {
-		return nil, fmt.Errorf("%w: expected leaf page, got flags %d", ErrCorruptedPage, h.flags)
+func (goPageCodec) DecodeLeafPage(buf []byte, h PageHeader) ([]LeafEntry, error) {
+	if h.Flags != PageFlagLeaf {
+		return nil, fmt.Errorf("%w: expected leaf page, got flags %d", ErrCorruptedPage, h.Flags)
 	}
-	entries := make([]leafEntry, 0, h.count)
+	entries := make([]LeafEntry, 0, h.Count)
 	off := pageHeaderSize
-	for i := 0; i < int(h.count); i++ {
+	for i := 0; i < int(h.Count); i++ {
 		if off+leafEntryHeaderSize > len(buf) {
 			return nil, ErrCorruptedPage
 		}
@@ -143,40 +201,44 @@ func decodeLeafPage(buf []byte, h pageHeader) ([]leafEntry, error) {
 		v := make([]byte, vlen)
 		copy(v, buf[off:off+vlen])
 		off += vlen
-		entries = append(entries, leafEntry{key: k, value: v})
+		entries = append(entries, LeafEntry{Key: k, Value: v})
 	}
 	return entries, nil
 }
 
-func encodeBranchPage(pageSize int, pgid PageID, txid uint64, entries []branchEntry) ([]byte, error) {
+func (goPageCodec) BranchEncodedSize(entries []BranchEntry) int {
+	return branchEncodedSize(entries)
+}
+
+func (c goPageCodec) EncodeBranchPage(pageSize int, pgid PageID, txid uint64, entries []BranchEntry) ([]byte, error) {
 	if branchEncodedSize(entries) > pageSize {
 		return nil, fmt.Errorf("%w: branch entries exceed page size %d", ErrKeyTooLarge, pageSize)
 	}
 	buf := make([]byte, pageSize)
 	off := pageHeaderSize
 	for _, e := range entries {
-		binary.LittleEndian.PutUint32(buf[off:off+4], uint32(len(e.key)))
-		binary.LittleEndian.PutUint64(buf[off+4:off+12], uint64(e.child))
+		binary.LittleEndian.PutUint32(buf[off:off+4], uint32(len(e.Key)))
+		binary.LittleEndian.PutUint64(buf[off+4:off+12], uint64(e.Child))
 		off += branchEntryHeaderSize
-		copy(buf[off:off+len(e.key)], e.key)
-		off += len(e.key)
+		copy(buf[off:off+len(e.Key)], e.Key)
+		off += len(e.Key)
 	}
-	writePageHeader(buf, pageHeader{
-		pgid:  pgid,
-		flags: PageFlagBranch,
-		count: uint16(len(entries)),
-		txid:  txid,
-	})
+	copy(buf[0:pageHeaderSize], c.EncodePageHeader(PageHeader{
+		PGID:  pgid,
+		Flags: PageFlagBranch,
+		Count: uint16(len(entries)),
+		TxID:  txid,
+	}))
 	return buf, nil
 }
 
-func decodeBranchPage(buf []byte, h pageHeader) ([]branchEntry, error) {
-	if h.flags != PageFlagBranch {
-		return nil, fmt.Errorf("%w: expected branch page, got flags %d", ErrCorruptedPage, h.flags)
+func (goPageCodec) DecodeBranchPage(buf []byte, h PageHeader) ([]BranchEntry, error) {
+	if h.Flags != PageFlagBranch {
+		return nil, fmt.Errorf("%w: expected branch page, got flags %d", ErrCorruptedPage, h.Flags)
 	}
-	entries := make([]branchEntry, 0, h.count)
+	entries := make([]BranchEntry, 0, h.Count)
 	off := pageHeaderSize
-	for i := 0; i < int(h.count); i++ {
+	for i := 0; i < int(h.Count); i++ {
 		if off+branchEntryHeaderSize > len(buf) {
 			return nil, ErrCorruptedPage
 		}
@@ -189,7 +251,29 @@ func decodeBranchPage(buf []byte, h pageHeader) ([]branchEntry, error) {
 		k := make([]byte, klen)
 		copy(k, buf[off:off+klen])
 		off += klen
-		entries = append(entries, branchEntry{key: k, child: child})
+		entries = append(entries, BranchEntry{Key: k, Child: child})
 	}
 	return entries, nil
+}
+
+// Package-internal default helpers used by tests and fuzzers.
+
+func readAndVerifyPageHeader(buf []byte, expectedPGID PageID) (PageHeader, error) {
+	return readAndVerifyPageHeaderWithCore(defaultGoCore, buf, expectedPGID)
+}
+
+func encodeLeafPage(pageSize int, pgid PageID, txid uint64, entries []LeafEntry) ([]byte, error) {
+	return encodeLeafPageWithCore(defaultGoCore, pageSize, pgid, txid, entries)
+}
+
+func decodeLeafPage(buf []byte, h PageHeader) ([]LeafEntry, error) {
+	return defaultGoCore.DecodeLeafPage(buf, h)
+}
+
+func encodeBranchPage(pageSize int, pgid PageID, txid uint64, entries []BranchEntry) ([]byte, error) {
+	return encodeBranchPageWithCore(defaultGoCore, pageSize, pgid, txid, entries)
+}
+
+func decodeBranchPage(buf []byte, h PageHeader) ([]BranchEntry, error) {
+	return defaultGoCore.DecodeBranchPage(buf, h)
 }

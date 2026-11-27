@@ -8,13 +8,13 @@ package GroundKVBTree
 import (
 	os "os"
 
-	m_GroundKVCodec "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVCodec"
-	m_GroundKVEngine "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVEngine"
-	m_GroundKVFreelist "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVFreelist"
-	m_GroundKVNode "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVNode"
-	m_GroundKVTypes "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVTypes"
-	m__System "github.com/flaneur2020/groundkv/verified/dafnygen/System_"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	m_GroundKVCodec "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
+	m_GroundKVEngine "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVEngine"
+	m_GroundKVFreelist "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVFreelist"
+	m_GroundKVNode "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVNode"
+	m_GroundKVTypes "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	m__System "github.com/flaneur2020/groundkv/verified/internal/dafnygen/System_"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
 var _ = os.Args
@@ -389,6 +389,54 @@ func (_static *CompanionStruct_Default___) ChunkHi(chunks _dafny.Sequence, i _da
 		return hi
 	}
 }
+func (_static *CompanionStruct_Default___) AllocBranchChunks(store _dafny.Map, nextID uint64, chunks _dafny.Sequence, pageSize uint32) (bool, _dafny.Map, uint64, _dafny.Sequence) {
+	var ok bool = false
+	_ = ok
+	var newStore _dafny.Map = _dafny.EmptyMap
+	_ = newStore
+	var newNextID uint64 = uint64(0)
+	_ = newNextID
+	var results _dafny.Sequence = _dafny.EmptySeq
+	_ = results
+	var _0_flat _dafny.Sequence
+	_ = _0_flat
+	_0_flat = m_GroundKVNode.Companion_Default___.FlattenBranch(chunks)
+	newStore = store
+	newNextID = nextID
+	results = _dafny.SeqOf()
+	var _1_i _dafny.Int
+	_ = _1_i
+	_1_i = _dafny.Zero
+	for (_1_i).Cmp(_dafny.IntOfUint32((chunks).Cardinality())) < 0 {
+		if (newNextID) == (uint64(18446744073709551615)) {
+			var _rhs0 bool = false
+			_ = _rhs0
+			var _rhs1 _dafny.Map = store
+			_ = _rhs1
+			var _rhs2 uint64 = nextID
+			_ = _rhs2
+			var _rhs3 _dafny.Sequence = _dafny.SeqOf()
+			_ = _rhs3
+			ok = _rhs0
+			newStore = _rhs1
+			newNextID = _rhs2
+			results = _rhs3
+			return ok, newStore, newNextID, results
+		}
+		var _2_c _dafny.Sequence
+		_ = _2_c
+		_2_c = (chunks).Select((_1_i).Uint32()).(_dafny.Sequence)
+		var _3_cid uint64
+		_ = _3_cid
+		_3_cid = newNextID
+		newNextID = (_3_cid) + (uint64(1))
+		newStore = (newStore).Update(_3_cid, Companion_Page_.Create_BranchPage_(_2_c))
+		results = _dafny.Companion_Sequence_.Concatenate(results, _dafny.SeqOf(m_GroundKVTypes.Companion_BranchEntry_.Create_BranchEntry_(((_2_c).Select(0).(m_GroundKVTypes.BranchEntry)).Dtor_key(), _3_cid)))
+		_1_i = (_1_i).Plus(_dafny.One)
+	}
+	ok = true
+	return ok, newStore, newNextID, results
+}
 func (_static *CompanionStruct_Default___) TreePutNode(store _dafny.Map, nextID uint64, pgid uint64, key _dafny.Sequence, value _dafny.Sequence, pageSize uint32, maxLeafKeys _dafny.Int, maxBranchKeys _dafny.Int) (bool, _dafny.Map, uint64, _dafny.Sequence) {
 	var ok bool = false
 	_ = ok
@@ -526,40 +574,19 @@ func (_static *CompanionStruct_Default___) TreePutNode(store _dafny.Map, nextID 
 				_out7 = m_GroundKVNode.Companion_Default___.SplitBranchEntries(_14_updated, pageSize, maxBranchKeys)
 				_15_finalChunks = _out7
 			}
-			newStore = _9_st1
-			newNextID = _10_nid1
-			results = _dafny.SeqOf()
-			var _16_i _dafny.Int
-			_ = _16_i
-			_16_i = _dafny.Zero
-			for (_16_i).Cmp(_dafny.IntOfUint32((_15_finalChunks).Cardinality())) < 0 {
-				if (newNextID) == (uint64(18446744073709551615)) {
-					var _rhs8 bool = false
-					_ = _rhs8
-					var _rhs9 _dafny.Map = store
-					_ = _rhs9
-					var _rhs10 uint64 = nextID
-					_ = _rhs10
-					var _rhs11 _dafny.Sequence = _dafny.SeqOf()
-					_ = _rhs11
-					ok = _rhs8
-					newStore = _rhs9
-					newNextID = _rhs10
-					results = _rhs11
-					return ok, newStore, newNextID, results
-				}
-				var _17_c _dafny.Sequence
-				_ = _17_c
-				_17_c = (_15_finalChunks).Select((_16_i).Uint32()).(_dafny.Sequence)
-				var _18_cid uint64
-				_ = _18_cid
-				_18_cid = newNextID
-				newNextID = (_18_cid) + (uint64(1))
-				newStore = (newStore).Update(_18_cid, Companion_Page_.Create_BranchPage_(_17_c))
-				results = _dafny.Companion_Sequence_.Concatenate(results, _dafny.SeqOf(m_GroundKVTypes.Companion_BranchEntry_.Create_BranchEntry_(((_17_c).Select(0).(m_GroundKVTypes.BranchEntry)).Dtor_key(), _18_cid)))
-				_16_i = (_16_i).Plus(_dafny.One)
-			}
-			ok = true
+			var _out8 bool
+			_ = _out8
+			var _out9 _dafny.Map
+			_ = _out9
+			var _out10 uint64
+			_ = _out10
+			var _out11 _dafny.Sequence
+			_ = _out11
+			_out8, _out9, _out10, _out11 = Companion_Default___.AllocBranchChunks(_9_st1, _10_nid1, _15_finalChunks, pageSize)
+			ok = _out8
+			newStore = _out9
+			newNextID = _out10
+			results = _out11
 		}
 		goto Lmatch0
 	}

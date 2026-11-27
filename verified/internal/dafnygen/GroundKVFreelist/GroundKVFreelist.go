@@ -8,10 +8,10 @@ package GroundKVFreelist
 import (
 	os "os"
 
-	m_GroundKVCodec "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVCodec"
-	m_GroundKVTypes "github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVTypes"
-	m__System "github.com/flaneur2020/groundkv/verified/dafnygen/System_"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	m_GroundKVCodec "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
+	m_GroundKVTypes "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	m__System "github.com/flaneur2020/groundkv/verified/internal/dafnygen/System_"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
 var _ = os.Args

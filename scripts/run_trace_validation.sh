@@ -37,7 +37,7 @@ java -XX:+UseParallelGC -cp "$CP" tlc2.TLC \
 echo "==> 2. Exporting real Go execution traces from DST swarm seeds"
 TRACE_DIR="${WORK_DIR}/traces"
 mkdir -p "$TRACE_DIR"
-GROUNDKV_TRACE_DIR="$TRACE_DIR" go test -v ./dst -run '^TestExportDSTTraces$'
+GROUNDKV_TRACE_DIR="$TRACE_DIR" go test -v ./verify/dst -run '^TestExportDSTTraces$'
 
 echo "==> 3. Running TLA+ Trace Validation against every real Go execution trace"
 count=0

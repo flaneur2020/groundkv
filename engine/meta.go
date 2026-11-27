@@ -25,11 +25,47 @@ type Meta struct {
 	Freelist  PageID
 }
 
+// MetaCore abstracts dual-meta superblock codecs, slot parity, and recovery selection.
+type MetaCore interface {
+	MetaSlot(txid uint64) PageID
+	EncodeMetaPage(pageSize int, slot PageID, m Meta) ([]byte, error)
+	DecodeMetaPayload(buf []byte, slot PageID, h PageHeader) (Meta, error)
+	SelectRecoveredMeta(meta0 Meta, ok0 bool, meta1 Meta, ok1 bool) (Meta, error)
+}
+
+func encodeMetaPageWithCore(c MetaCore, pageSize int, slot PageID, m Meta) []byte {
+	buf, err := c.EncodeMetaPage(pageSize, slot, m)
+	if err != nil {
+		panic(fmt.Sprintf("groundkv: encodeMetaPage failed for pageSize %d: %v", pageSize, err))
+	}
+	StampPageChecksum(buf)
+	return buf
+}
+
+func decodeMetaPageWithCore(c Core, buf []byte, slot PageID) (Meta, error) {
+	h, err := readAndVerifyPageHeaderWithCore(c, buf, slot)
+	if err != nil {
+		return Meta{}, err
+	}
+	return c.DecodeMetaPayload(buf, slot, h)
+}
+
+// --- Pure-Go MetaCore implementation ---
+
+type goMetaCore struct{}
+
 func metaSlot(txid uint64) PageID {
 	return PageID(txid % 2)
 }
 
-func encodeMetaPage(pageSize int, slot PageID, m Meta) []byte {
+func (goMetaCore) MetaSlot(txid uint64) PageID {
+	return metaSlot(txid)
+}
+
+func (goMetaCore) EncodeMetaPage(pageSize int, slot PageID, m Meta) ([]byte, error) {
+	if pageSize < pageHeaderSize+metaPayloadSize {
+		return nil, ErrCorruptedMeta
+	}
 	buf := make([]byte, pageSize)
 	off := pageHeaderSize
 	binary.LittleEndian.PutUint32(buf[off:off+4], m.Magic)
@@ -40,22 +76,17 @@ func encodeMetaPage(pageSize int, slot PageID, m Meta) []byte {
 	binary.LittleEndian.PutUint64(buf[off+24:off+32], uint64(m.HighWater))
 	binary.LittleEndian.PutUint64(buf[off+32:off+40], m.TxID)
 	binary.LittleEndian.PutUint64(buf[off+40:off+48], uint64(m.Freelist))
-
-	writePageHeader(buf, pageHeader{
-		pgid:  slot,
-		flags: PageFlagMeta,
-		count: 1,
-		txid:  m.TxID,
-	})
-	return buf
+	copy(buf[0:pageHeaderSize], (goPageCodec{}).EncodePageHeader(PageHeader{
+		PGID:  slot,
+		Flags: PageFlagMeta,
+		Count: 1,
+		TxID:  m.TxID,
+	}))
+	return buf, nil
 }
 
-func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
-	h, err := readAndVerifyPageHeader(buf, slot)
-	if err != nil {
-		return Meta{}, err
-	}
-	if h.flags != PageFlagMeta || len(buf) < pageHeaderSize+metaPayloadSize {
+func (goMetaCore) DecodeMetaPayload(buf []byte, slot PageID, h PageHeader) (Meta, error) {
+	if h.Flags != PageFlagMeta || len(buf) < pageHeaderSize+metaPayloadSize {
 		return Meta{}, fmt.Errorf("%w: page %d is not a valid meta page", ErrCorruptedMeta, slot)
 	}
 	off := pageHeaderSize
@@ -71,8 +102,8 @@ func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
 	if m.Magic != metaMagic || m.Version != metaVersion {
 		return Meta{}, fmt.Errorf("%w: magic/version mismatch on meta %d", ErrCorruptedMeta, slot)
 	}
-	if h.txid != m.TxID {
-		return Meta{}, fmt.Errorf("%w: header txid %d != payload txid %d on meta %d", ErrCorruptedMeta, h.txid, m.TxID, slot)
+	if h.TxID != m.TxID {
+		return Meta{}, fmt.Errorf("%w: header txid %d != payload txid %d on meta %d", ErrCorruptedMeta, h.TxID, m.TxID, slot)
 	}
 	if m.TxID > 0 && metaSlot(m.TxID) != slot {
 		return Meta{}, fmt.Errorf("%w: meta slot %d parity mismatch for txid %d", ErrCorruptedMeta, slot, m.TxID)
@@ -87,4 +118,30 @@ func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
 		return Meta{}, fmt.Errorf("%w: invalid freelist %d (highWater %d) on meta %d", ErrCorruptedMeta, m.Freelist, m.HighWater, slot)
 	}
 	return m, nil
+}
+
+func (goMetaCore) SelectRecoveredMeta(meta0 Meta, ok0 bool, meta1 Meta, ok1 bool) (Meta, error) {
+	switch {
+	case ok0 && ok1:
+		if meta0.TxID >= meta1.TxID {
+			return meta0, nil
+		}
+		return meta1, nil
+	case ok0:
+		return meta0, nil
+	case ok1:
+		return meta1, nil
+	default:
+		return Meta{}, ErrCorruptedMeta
+	}
+}
+
+// Package-internal default helpers used by tests and fuzzers.
+
+func encodeMetaPage(pageSize int, slot PageID, m Meta) []byte {
+	return encodeMetaPageWithCore(defaultGoCore, pageSize, slot, m)
+}
+
+func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
+	return decodeMetaPageWithCore(defaultGoCore, buf, slot)
 }

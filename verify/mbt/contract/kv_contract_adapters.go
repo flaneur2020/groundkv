@@ -1,4 +1,4 @@
-// Source: ../../models/contract/kv_contract.fizz
+// Source: ../../../formal/fizzbee/contract/kv_contract.fizz
 // Black-box contract adapter exercising GroundKV's public API on real POSIX
 // OSFileStorage with real concurrent goroutines (1 Writer + 2 lock-free
 // Readers + 1 MVCC SnapshotReader), binary keys, near-page-size values
@@ -319,7 +319,7 @@ func (a *SnapshotReaderRoleAdapter) ActionEndSnapshot(args []mbt.Arg) (any, erro
 	return "OK", nil
 }
 
-// KvContractModelAdapter wires models/contract/kv_contract.fizz as a pure
+// KvContractModelAdapter wires formal/fizzbee/contract/kv_contract.fizz as a pure
 // black-box contract on real OSFileStorage with parallel linearizability enabled.
 type KvContractModelAdapter struct {
 	dir        string

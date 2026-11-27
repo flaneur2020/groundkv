@@ -56,12 +56,22 @@ type Options struct {
 	// formal trace validation (e.g., TLA+ / TLC). Nil disables tracing with zero
 	// allocation overhead.
 	Tracer Tracer
+
+	// Core optionally selects the pure deterministic kernel implementation
+	// (binary codecs, B+Tree node operations & splits, MVCC freelist logic,
+	// dual-meta recovery selection, and commit phase guards).
+	// Nil defaults to GoCore() (pure Go stdlib). Pass verified.NewCore() to run
+	// the Z3-verified Dafny-compiled implementation.
+	Core Core
 }
 
 func (o *Options) withDefaults() (Options, error) {
 	var cfg Options
 	if o != nil {
 		cfg = *o
+	}
+	if cfg.Core == nil {
+		cfg.Core = GoCore()
 	}
 	if cfg.PageSize == 0 {
 		cfg.PageSize = DefaultPageSize

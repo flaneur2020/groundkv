@@ -13,10 +13,12 @@ type DB struct {
 	mu            sync.RWMutex
 	storage       Storage
 	opts          Options
+	core          Core
 	meta          Meta
 	writeTx       *Tx
 	readerCounts  map[uint64]int
-	freelist      *freelist
+	freelist      FreelistPool
+	reclaimedRuns uint64
 	freelistPages []PageID
 	dirtyAltMeta  bool
 	closed        bool
@@ -60,8 +62,9 @@ func OpenStorage(st Storage, opts *Options) (*DB, error) {
 	db := &DB{
 		storage:      st,
 		opts:         cfg,
+		core:         cfg.Core,
 		readerCounts: make(map[uint64]int),
-		freelist:     newFreelist(),
+		freelist:     cfg.Core.NewFreelist(),
 	}
 
 	if size == 0 {
@@ -90,7 +93,7 @@ func (db *DB) initEmpty() error {
 		Freelist:  0,
 	}
 	for slot := PageID(0); slot < 2; slot++ {
-		buf := encodeMetaPage(db.opts.PageSize, slot, m)
+		buf := encodeMetaPageWithCore(db.core, db.opts.PageSize, slot, m)
 		if _, err := db.storage.WriteAt(buf, int64(slot)*int64(db.opts.PageSize)); err != nil {
 			return err
 		}
@@ -127,27 +130,12 @@ func (db *DB) recover() error {
 			err1 = fmt.Errorf("%w: meta1 pageSize %d != %d", ErrCorruptedMeta, meta1.PageSize, ps)
 		}
 
-		switch {
-		case err0 == nil && err1 == nil:
-			if meta0.TxID >= meta1.TxID {
-				db.meta = meta0
-			} else {
-				db.meta = meta1
-			}
+		if chosen, selErr := db.core.SelectRecoveredMeta(meta0, err0 == nil, meta1, err1 == nil); selErr == nil {
+			db.meta = chosen
 			db.opts.PageSize = ps
 			recovered = true
-		case err0 == nil:
-			db.meta = meta0
-			db.opts.PageSize = ps
-			recovered = true
-		case err1 == nil:
-			db.meta = meta1
-			db.opts.PageSize = ps
-			recovered = true
-		default:
-			if ps == db.opts.PageSize {
-				lastErr0, lastErr1 = err0, err1
-			}
+		} else if ps == db.opts.PageSize {
+			lastErr0, lastErr1 = err0, err1
 		}
 		if recovered {
 			break
@@ -164,8 +152,8 @@ func (db *DB) recover() error {
 	if db.meta.Root != 0 {
 		if _, h, err := db.readCommittedPageLocked(db.meta.Root); err != nil {
 			return fmt.Errorf("groundkv: recover root page %d: %w", db.meta.Root, err)
-		} else if h.flags != PageFlagLeaf && h.flags != PageFlagBranch {
-			return fmt.Errorf("%w: root page %d has invalid flags %d", ErrCorruptedPage, db.meta.Root, h.flags)
+		} else if h.Flags != PageFlagLeaf && h.Flags != PageFlagBranch {
+			return fmt.Errorf("%w: root page %d has invalid flags %d", ErrCorruptedPage, db.meta.Root, h.Flags)
 		}
 	}
 
@@ -178,7 +166,7 @@ func (db *DB) recover() error {
 			return fmt.Errorf("groundkv: recover freelist: %w", err)
 		}
 		db.freelistPages = chainPages
-		db.freelist.addPending(db.meta.TxID, freedIDs)
+		db.freelist.AddPending(db.meta.TxID, freedIDs)
 	}
 	return nil
 }
@@ -199,26 +187,26 @@ func (db *DB) readMetaSlotWithSize(slot PageID, pageSize int) (Meta, error) {
 	if err != nil && n < pageSize {
 		return Meta{}, err
 	}
-	return decodeMetaPage(buf, slot)
+	return decodeMetaPageWithCore(db.core, buf, slot)
 }
 
-func (db *DB) readCommittedPage(pgid PageID) ([]byte, pageHeader, error) {
+func (db *DB) readCommittedPage(pgid PageID) ([]byte, PageHeader, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.readCommittedPageLocked(pgid)
 }
 
-func (db *DB) readCommittedPageLocked(pgid PageID) ([]byte, pageHeader, error) {
+func (db *DB) readCommittedPageLocked(pgid PageID) ([]byte, PageHeader, error) {
 	if db.closed {
-		return nil, pageHeader{}, ErrDBClosed
+		return nil, PageHeader{}, ErrDBClosed
 	}
 	buf := make([]byte, db.opts.PageSize)
 	off := int64(pgid) * int64(db.opts.PageSize)
 	n, err := db.storage.ReadAt(buf, off)
 	if err != nil && n < db.opts.PageSize {
-		return nil, pageHeader{}, err
+		return nil, PageHeader{}, err
 	}
-	h, err := readAndVerifyPageHeader(buf, pgid)
+	h, err := readAndVerifyPageHeaderWithCore(db.core, buf, pgid)
 	return buf, h, err
 }
 
@@ -247,14 +235,8 @@ func (db *DB) minActiveReaderTxIDLocked() (uint64, bool) {
 // to recycle without overwriting any page reachable from either on-disk meta
 // slot (currentTxID and currentTxID-1) or any open MVCC read snapshot.
 func (db *DB) releaseBoundLocked() uint64 {
-	var bound uint64
-	if db.meta.TxID > 0 {
-		bound = db.meta.TxID - 1
-	}
-	if minR, ok := db.minActiveReaderTxIDLocked(); ok && minR < bound {
-		bound = minR
-	}
-	return bound
+	minR, hasReader := db.minActiveReaderTxIDLocked()
+	return db.core.ReleaseBound(db.meta.TxID, hasReader, minR)
 }
 
 // MinActiveReaderTxID returns the lowest TxID among currently open read-only
@@ -285,9 +267,9 @@ func (db *DB) FreelistState() FreelistSnapshot {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return FreelistSnapshot{
-		FreeIDs:       db.freelist.freeIDs(),
-		PendingTxIDs:  db.freelist.pendingTxIDs(),
-		ReclaimedHits: db.freelist.reclaimedRuns,
+		FreeIDs:       db.freelist.FreeIDs(),
+		PendingTxIDs:  db.freelist.PendingTxIDs(),
+		ReclaimedHits: db.reclaimedRuns,
 	}
 }
 
@@ -334,13 +316,13 @@ func (db *DB) collectTreePagesLocked(pgid PageID, visited map[PageID]bool) error
 	if err != nil {
 		return err
 	}
-	if h.flags == PageFlagBranch {
-		entries, err := decodeBranchPage(buf, h)
+	if h.Flags == PageFlagBranch {
+		entries, err := db.core.DecodeBranchPage(buf, h)
 		if err != nil {
 			return err
 		}
 		for _, e := range entries {
-			if err := db.collectTreePagesLocked(e.child, visited); err != nil {
+			if err := db.collectTreePagesLocked(e.Child, visited); err != nil {
 				return err
 			}
 		}
@@ -376,11 +358,12 @@ func (db *DB) BeginWrite() (*Tx, error) {
 		return nil, ErrWriteTxActive
 	}
 	if !db.opts.NoFreelist {
-		db.freelist.release(db.releaseBoundLocked())
+		db.freelist.Release(db.releaseBoundLocked())
 	}
 	tx := &Tx{
 		db:       db,
 		writable: true,
+		phase:    CommitPhaseActive,
 		meta:     db.meta,
 		dirty:    make(map[PageID][]byte),
 		freed:    make(map[PageID]struct{}),

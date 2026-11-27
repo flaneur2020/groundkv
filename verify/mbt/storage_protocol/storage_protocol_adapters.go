@@ -1,4 +1,4 @@
-// Source: ../../models/storage_protocol/storage_protocol.fizz
+// Source: ../../../formal/fizzbee/storage_protocol/storage_protocol.fizz
 // Unified white-box storage protocol adapter driving real 4-phase commits,
 // MVCC reader-aware freelist reclamation, and 3 disk crash modes with ZERO
 // shadow state on the adapter (every checked invariant is observed directly
@@ -476,7 +476,7 @@ func (a *EngineRoleAdapter) ActionReadSnapshot(args []mbt.Arg) (any, error) {
 	return string(val), nil
 }
 
-// StorageProtocolModelAdapter wires models/storage_protocol/storage_protocol.fizz.
+// StorageProtocolModelAdapter wires formal/fizzbee/storage_protocol/storage_protocol.fizz.
 type StorageProtocolModelAdapter struct {
 	harness    *sharedHarness
 	diskRole   *DiskRoleAdapter

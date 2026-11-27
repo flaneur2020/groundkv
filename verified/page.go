@@ -1,118 +1,140 @@
 package verified
 
 import (
-	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVCodec"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVTypes"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
-const (
-	pageHeaderSize        = 24
-	leafEntryHeaderSize   = 8
-	branchEntryHeaderSize = 12
-)
+type dafnyPageCodec struct{}
 
-type pageHeader struct {
-	pgid     PageID
-	flags    uint16
-	count    uint16
-	checksum uint32
-	txid     uint64
+var _ engine.PageCodec = dafnyPageCodec{}
+
+func toDafnyHeader(h engine.PageHeader) GroundKVTypes.PageHeader {
+	return GroundKVTypes.Companion_PageHeader_.Create_PageHeader_(
+		uint64(h.PGID), h.Flags, h.Count, h.Checksum, h.TxID,
+	)
 }
 
-type leafEntry struct {
-	key   []byte
-	value []byte
+func fromDafnyHeader(h GroundKVTypes.PageHeader) engine.PageHeader {
+	return engine.PageHeader{
+		PGID:     engine.PageID(h.Dtor_pgid()),
+		Flags:    h.Dtor_flags(),
+		Count:    h.Dtor_count(),
+		Checksum: h.Dtor_checksum(),
+		TxID:     h.Dtor_txid(),
+	}
 }
 
-type branchEntry struct {
-	key   []byte
-	child PageID
+func toDafnyLeafEntries(entries []engine.LeafEntry) _dafny.Sequence {
+	if len(entries) == 0 {
+		return _dafny.EmptySeq
+	}
+	items := make([]interface{}, len(entries))
+	for i, e := range entries {
+		items[i] = GroundKVTypes.Companion_LeafEntry_.Create_LeafEntry_(
+			_dafny.SeqOfBytes(e.Key),
+			_dafny.SeqOfBytes(e.Value),
+		)
+	}
+	return _dafny.SeqOf(items...)
 }
 
-func readAndVerifyPageHeader(buf []byte, expectedPGID PageID) (pageHeader, error) {
+func fromDafnyLeafEntries(seq _dafny.Sequence) []engine.LeafEntry {
+	n := int(seq.Cardinality())
+	out := make([]engine.LeafEntry, n)
+	for i := 0; i < n; i++ {
+		e := seq.Select(uint32(i)).(GroundKVTypes.LeafEntry)
+		out[i] = engine.LeafEntry{
+			Key:   _dafny.ToByteArray(e.Dtor_key()),
+			Value: _dafny.ToByteArray(e.Dtor_value()),
+		}
+	}
+	return out
+}
+
+func toDafnyBranchEntries(entries []engine.BranchEntry) _dafny.Sequence {
+	if len(entries) == 0 {
+		return _dafny.EmptySeq
+	}
+	items := make([]interface{}, len(entries))
+	for i, e := range entries {
+		items[i] = GroundKVTypes.Companion_BranchEntry_.Create_BranchEntry_(
+			_dafny.SeqOfBytes(e.Key),
+			uint64(e.Child),
+		)
+	}
+	return _dafny.SeqOf(items...)
+}
+
+func fromDafnyBranchEntries(seq _dafny.Sequence) []engine.BranchEntry {
+	n := int(seq.Cardinality())
+	out := make([]engine.BranchEntry, n)
+	for i := 0; i < n; i++ {
+		e := seq.Select(uint32(i)).(GroundKVTypes.BranchEntry)
+		out[i] = engine.BranchEntry{
+			Key:   _dafny.ToByteArray(e.Dtor_key()),
+			Child: engine.PageID(e.Dtor_child()),
+		}
+	}
+	return out
+}
+
+func (dafnyPageCodec) EncodePageHeader(h engine.PageHeader) []byte {
+	return _dafny.ToByteArray(GroundKVCodec.Companion_Default___.EncodePageHeader(toDafnyHeader(h)))
+}
+
+func (dafnyPageCodec) DecodePageHeader(buf []byte) (engine.PageHeader, error) {
 	res := GroundKVCodec.Companion_Default___.DecodePageHeader(_dafny.SeqOfBytes(buf))
 	if res.Is_Err() {
-		return pageHeader{}, fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode))
+		return engine.PageHeader{}, fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode))
 	}
-	h := fromDafnyHeader(res.Dtor_value().(GroundKVTypes.PageHeader))
-	if h.pgid != expectedPGID {
-		return pageHeader{}, fmt.Errorf("%w: expected pgid %d, got %d", engine.ErrCorruptedPage, expectedPGID, h.pgid)
-	}
-	tmp := make([]byte, len(buf))
-	copy(tmp, buf)
-	binary.LittleEndian.PutUint32(tmp[12:16], 0)
-	if crc32.ChecksumIEEE(tmp) != h.checksum {
-		return pageHeader{}, fmt.Errorf("%w: checksum mismatch on pgid %d", engine.ErrCorruptedPage, expectedPGID)
-	}
-	return h, nil
+	return fromDafnyHeader(res.Dtor_value().(GroundKVTypes.PageHeader)), nil
 }
 
-func leafEncodedSize(entries []leafEntry) int {
+func (dafnyPageCodec) LeafEncodedSize(entries []engine.LeafEntry) int {
 	return GroundKVCodec.Companion_Default___.LeafEncodedSize(toDafnyLeafEntries(entries)).Int()
 }
 
-func branchEncodedSize(entries []branchEntry) int {
-	return GroundKVCodec.Companion_Default___.BranchEncodedSize(toDafnyBranchEntries(entries)).Int()
-}
-
-func encodeLeafPage(pageSize int, pgid PageID, txid uint64, entries []leafEntry) ([]byte, error) {
-	res := GroundKVCodec.Companion_Default___.EncodeLeafPage(
-		uint32(pageSize),
-		uint64(pgid),
-		txid,
-		toDafnyLeafEntries(entries),
-	)
+func (dafnyPageCodec) EncodeLeafPage(pageSize int, pgid engine.PageID, txid uint64, entries []engine.LeafEntry) ([]byte, error) {
+	res := GroundKVCodec.Companion_Default___.EncodeLeafPage(uint32(pageSize), uint64(pgid), txid, toDafnyLeafEntries(entries))
 	if res.Is_Err() {
 		return nil, fmt.Errorf("%w: leaf entries exceed page size %d",
 			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), pageSize)
 	}
-	buf := _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence))
-	stampPageChecksum(buf)
-	return buf, nil
+	return _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence)), nil
 }
 
-func decodeLeafPage(buf []byte, h pageHeader) ([]leafEntry, error) {
-	res := GroundKVCodec.Companion_Default___.DecodeLeafPage(
-		_dafny.SeqOfBytes(buf),
-		toDafnyHeader(h),
-	)
+func (dafnyPageCodec) DecodeLeafPage(buf []byte, h engine.PageHeader) ([]engine.LeafEntry, error) {
+	res := GroundKVCodec.Companion_Default___.DecodeLeafPage(_dafny.SeqOfBytes(buf), toDafnyHeader(h))
 	if res.Is_Err() {
 		return nil, fmt.Errorf("%w: leaf decode failed (flags %d)",
-			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.flags)
+			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.Flags)
 	}
 	return fromDafnyLeafEntries(res.Dtor_value().(_dafny.Sequence)), nil
 }
 
-func encodeBranchPage(pageSize int, pgid PageID, txid uint64, entries []branchEntry) ([]byte, error) {
-	res := GroundKVCodec.Companion_Default___.EncodeBranchPage(
-		uint32(pageSize),
-		uint64(pgid),
-		txid,
-		toDafnyBranchEntries(entries),
-	)
+func (dafnyPageCodec) BranchEncodedSize(entries []engine.BranchEntry) int {
+	return GroundKVCodec.Companion_Default___.BranchEncodedSize(toDafnyBranchEntries(entries)).Int()
+}
+
+func (dafnyPageCodec) EncodeBranchPage(pageSize int, pgid engine.PageID, txid uint64, entries []engine.BranchEntry) ([]byte, error) {
+	res := GroundKVCodec.Companion_Default___.EncodeBranchPage(uint32(pageSize), uint64(pgid), txid, toDafnyBranchEntries(entries))
 	if res.Is_Err() {
 		return nil, fmt.Errorf("%w: branch entries exceed page size %d",
 			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), pageSize)
 	}
-	buf := _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence))
-	stampPageChecksum(buf)
-	return buf, nil
+	return _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence)), nil
 }
 
-func decodeBranchPage(buf []byte, h pageHeader) ([]branchEntry, error) {
-	res := GroundKVCodec.Companion_Default___.DecodeBranchPage(
-		_dafny.SeqOfBytes(buf),
-		toDafnyHeader(h),
-	)
+func (dafnyPageCodec) DecodeBranchPage(buf []byte, h engine.PageHeader) ([]engine.BranchEntry, error) {
+	res := GroundKVCodec.Companion_Default___.DecodeBranchPage(_dafny.SeqOfBytes(buf), toDafnyHeader(h))
 	if res.Is_Err() {
 		return nil, fmt.Errorf("%w: branch decode failed (flags %d)",
-			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.flags)
+			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), h.Flags)
 	}
 	return fromDafnyBranchEntries(res.Dtor_value().(_dafny.Sequence)), nil
 }

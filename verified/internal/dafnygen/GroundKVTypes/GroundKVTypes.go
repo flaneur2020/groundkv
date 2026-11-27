@@ -8,8 +8,8 @@ package GroundKVTypes
 import (
 	os "os"
 
-	m__System "github.com/flaneur2020/groundkv/verified/dafnygen/System_"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	m__System "github.com/flaneur2020/groundkv/verified/internal/dafnygen/System_"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
 var _ = os.Args

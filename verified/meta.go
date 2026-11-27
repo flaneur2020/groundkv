@@ -3,43 +3,68 @@ package verified
 import (
 	"fmt"
 
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVCodec"
-	"github.com/flaneur2020/groundkv/verified/dafnygen/GroundKVTypes"
-	_dafny "github.com/flaneur2020/groundkv/verified/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/engine"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVEngine"
+	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
 )
 
-const (
-	metaMagic   uint32 = 0x47524B56 // "GRKV"
-	metaVersion uint32 = 1
-)
+type dafnyMetaCore struct{}
 
-func metaSlot(txid uint64) PageID {
-	return PageID(GroundKVCodec.Companion_Default___.MetaSlot(txid))
+var _ engine.MetaCore = dafnyMetaCore{}
+
+func toDafnyMeta(m engine.Meta) GroundKVTypes.Meta {
+	return GroundKVTypes.Companion_Meta_.Create_Meta_(
+		m.Magic, m.Version, m.PageSize, uint64(m.Root), uint64(m.HighWater), m.TxID, uint64(m.Freelist),
+	)
 }
 
-func encodeMetaPage(pageSize int, slot PageID, m Meta) []byte {
+func fromDafnyMeta(m GroundKVTypes.Meta) engine.Meta {
+	return engine.Meta{
+		Magic:     m.Dtor_magic(),
+		Version:   m.Dtor_version(),
+		PageSize:  m.Dtor_pageSize(),
+		Root:      engine.PageID(m.Dtor_root()),
+		HighWater: engine.PageID(m.Dtor_highWater()),
+		TxID:      m.Dtor_txid(),
+		Freelist:  engine.PageID(m.Dtor_freelist()),
+	}
+}
+
+func (dafnyMetaCore) MetaSlot(txid uint64) engine.PageID {
+	return engine.PageID(GroundKVCodec.Companion_Default___.MetaSlot(txid))
+}
+
+func (dafnyMetaCore) EncodeMetaPage(pageSize int, slot engine.PageID, m engine.Meta) ([]byte, error) {
 	res := GroundKVCodec.Companion_Default___.EncodeMetaPage(uint32(pageSize), uint64(slot), toDafnyMeta(m))
 	if res.Is_Err() {
-		panic(fmt.Sprintf("groundkv/verified: encodeMetaPage invalid pageSize %d", pageSize))
+		return nil, fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode))
 	}
-	buf := _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence))
-	stampPageChecksum(buf)
-	return buf
+	return _dafny.ToByteArray(res.Dtor_value().(_dafny.Sequence)), nil
 }
 
-func decodeMetaPage(buf []byte, slot PageID) (Meta, error) {
-	h, err := readAndVerifyPageHeader(buf, slot)
-	if err != nil {
-		return Meta{}, err
-	}
-	res := GroundKVCodec.Companion_Default___.DecodeMetaPayload(
-		_dafny.SeqOfBytes(buf),
-		uint64(slot),
-		toDafnyHeader(h),
-	)
+func (dafnyMetaCore) DecodeMetaPayload(buf []byte, slot engine.PageID, h engine.PageHeader) (engine.Meta, error) {
+	res := GroundKVCodec.Companion_Default___.DecodeMetaPayload(_dafny.SeqOfBytes(buf), uint64(slot), toDafnyHeader(h))
 	if res.Is_Err() {
-		return Meta{}, fmt.Errorf("%w: invalid meta page %d",
+		return engine.Meta{}, fmt.Errorf("%w: invalid meta page %d",
 			fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode)), slot)
+	}
+	return fromDafnyMeta(res.Dtor_value().(GroundKVTypes.Meta)), nil
+}
+
+func (dafnyMetaCore) SelectRecoveredMeta(meta0 engine.Meta, ok0 bool, meta1 engine.Meta, ok1 bool) (engine.Meta, error) {
+	opt0 := GroundKVTypes.Companion_Option_.Create_None_()
+	if ok0 {
+		opt0 = GroundKVTypes.Companion_Option_.Create_Some_(toDafnyMeta(meta0))
+	}
+	opt1 := GroundKVTypes.Companion_Option_.Create_None_()
+	if ok1 {
+		opt1 = GroundKVTypes.Companion_Option_.Create_Some_(toDafnyMeta(meta1))
+	}
+	res := GroundKVEngine.Companion_Default___.SelectRecoveredMeta(opt0, opt1)
+	if res.Is_Err() {
+		return engine.Meta{}, fromDafnyErrCode(res.Dtor_error().(GroundKVTypes.ErrCode))
 	}
 	return fromDafnyMeta(res.Dtor_value().(GroundKVTypes.Meta)), nil
 }

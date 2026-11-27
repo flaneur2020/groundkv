@@ -66,7 +66,7 @@ func (db *DB) emitTraceLocked(event string) {
 	if r, ok := db.minActiveReaderTxIDLocked(); ok {
 		minReader = int64(r)
 	}
-	pending := db.freelist.pendingTxIDs()
+	pending := db.freelist.PendingTxIDs()
 	if pending == nil {
 		pending = []uint64{}
 	}
@@ -80,7 +80,7 @@ func (db *DB) emitTraceLocked(event string) {
 		DirtyAltMeta:  db.dirtyAltMeta,
 		ActiveReaders: activeReaders,
 		MinReaderTxID: minReader,
-		FreeCount:     len(db.freelist.free),
+		FreeCount:     db.freelist.FreeCount(),
 		PendingTxIDs:  pending,
 		ReleaseBound:  db.releaseBoundLocked(),
 	})

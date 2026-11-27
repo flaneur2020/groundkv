@@ -24,17 +24,17 @@ func FuzzDecodePages(f *testing.F) {
 	}), uint64(0))
 
 	// Valid leaf page
-	if leaf, err := encodeLeafPage(ps, 2, 1, []leafEntry{
-		{key: []byte("a"), value: []byte("1")},
-		{key: []byte("b"), value: []byte("2")},
+	if leaf, err := encodeLeafPage(ps, 2, 1, []LeafEntry{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
 	}); err == nil {
 		f.Add(leaf, uint64(2))
 	}
 
 	// Valid branch page
-	if br, err := encodeBranchPage(ps, 3, 1, []branchEntry{
-		{key: []byte("a"), child: 2},
-		{key: []byte("m"), child: 4},
+	if br, err := encodeBranchPage(ps, 3, 1, []BranchEntry{
+		{Key: []byte("a"), Child: 2},
+		{Key: []byte("m"), Child: 4},
 	}); err == nil {
 		f.Add(br, uint64(3))
 	}
@@ -58,10 +58,10 @@ func FuzzDecodePages(f *testing.F) {
 			// Also test decoders with synthetic headers even when CRC fails,
 			// exercising malformed count/length guards directly.
 			if len(raw) >= pageHeaderSize {
-				synth := pageHeader{
-					pgid:  id,
-					flags: binary.LittleEndian.Uint16(raw[8:10]),
-					count: binary.LittleEndian.Uint16(raw[10:12]),
+				synth := PageHeader{
+					PGID:  id,
+					Flags: binary.LittleEndian.Uint16(raw[8:10]),
+					Count: binary.LittleEndian.Uint16(raw[10:12]),
 				}
 				_, _ = decodeLeafPage(raw, synth)
 				_, _ = decodeBranchPage(raw, synth)
@@ -70,7 +70,7 @@ func FuzzDecodePages(f *testing.F) {
 			return
 		}
 
-		switch h.flags {
+		switch h.Flags {
 		case PageFlagMeta:
 			_, _ = decodeMetaPage(raw, id)
 		case PageFlagLeaf:
@@ -120,7 +120,7 @@ func FuzzOpenCorruptStorage(f *testing.F) {
 	if db, err := OpenStorage(stCycle, &Options{PageSize: 256}); err == nil {
 		_ = db.Close()
 		img := stCycle.CloneDurable().working
-		brBuf, _ := encodeBranchPage(256, 2, 1, []branchEntry{{key: []byte("a"), child: 2}})
+		brBuf, _ := encodeBranchPage(256, 2, 1, []BranchEntry{{Key: []byte("a"), Child: 2}})
 		metaBuf := encodeMetaPage(256, 1, Meta{
 			Magic: metaMagic, Version: metaVersion, PageSize: 256,
 			Root: 2, HighWater: 3, TxID: 1,

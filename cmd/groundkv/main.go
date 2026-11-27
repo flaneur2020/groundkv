@@ -10,45 +10,12 @@ import (
 	"github.com/flaneur2020/groundkv/verified"
 )
 
-// kvStore unifies the pure-Go engine (`engine.DB`) and the Dafny-verified
-// engine (`verified.DB`) so CLI users can choose either implementation.
-type kvStore interface {
-	Put(key, value []byte) error
-	Get(key []byte) ([]byte, error)
-	Delete(key []byte) error
-	Meta() engine.Meta
-	DualMeta() (engine.Meta, engine.Meta, error)
-	Validate() error
-	Close() error
-	ScanAll(fn func(k, v []byte) bool) error
-}
-
-type goEngineStore struct{ *engine.DB }
-
-func (s goEngineStore) ScanAll(fn func(k, v []byte) bool) error {
-	return s.View(func(tx *engine.Tx) error { return tx.Scan(nil, nil, fn) })
-}
-
-type verifiedEngineStore struct{ *verified.DB }
-
-func (s verifiedEngineStore) ScanAll(fn func(k, v []byte) bool) error {
-	return s.View(func(tx *verified.Tx) error { return tx.Scan(nil, nil, fn) })
-}
-
-func openStore(impl, path string) (kvStore, error) {
+func openDB(impl, path string) (*engine.DB, error) {
 	switch impl {
 	case "go":
-		db, err := engine.Open(path, nil)
-		if err != nil {
-			return nil, err
-		}
-		return goEngineStore{db}, nil
+		return engine.Open(path, nil)
 	case "verified", "dafny":
-		db, err := verified.Open(path, nil)
-		if err != nil {
-			return nil, err
-		}
-		return verifiedEngineStore{db}, nil
+		return verified.Open(path, nil)
 	default:
 		return nil, fmt.Errorf("unknown engine %q (expected \"go\" or \"verified\")", impl)
 	}
@@ -56,7 +23,7 @@ func openStore(impl, path string) (kvStore, error) {
 
 func main() {
 	dbPath := flag.String("db", "groundkv.db", "path to database file")
-	impl := flag.String("engine", "go", "storage engine implementation: go (pure Go) or verified (Dafny-verified Go)")
+	impl := flag.String("engine", "go", "storage kernel: go (pure Go) or verified (Dafny-verified Go)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -65,7 +32,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	db, err := openStore(*impl, *dbPath)
+	db, err := openDB(*impl, *dbPath)
 	if err != nil {
 		fatalf("open %s (%s): %v", *dbPath, *impl, err)
 	}
@@ -108,9 +75,11 @@ func main() {
 		fmt.Printf("OK (txid=%d, root=%d)\n", db.Meta().TxID, db.Meta().Root)
 
 	case "scan":
-		err := db.ScanAll(func(k, v []byte) bool {
-			fmt.Printf("%s=%s\n", k, v)
-			return true
+		err := db.View(func(tx *engine.Tx) error {
+			return tx.Scan(nil, nil, func(k, v []byte) bool {
+				fmt.Printf("%s=%s\n", k, v)
+				return true
+			})
 		})
 		if err != nil {
 			fatalf("scan: %v", err)
