@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"testing"
+
+	"github.com/flaneur2020/groundkv/engine/core"
 )
 
 // FuzzDecodePages hammers the low-level page header, meta, leaf, branch, and
@@ -12,19 +14,20 @@ import (
 // defensive truncation, flag, count, and checksum guard without panicking.
 func FuzzDecodePages(f *testing.F) {
 	const ps = 256
+	c := GoCore()
 
 	// Valid meta page (even slot 0 with even TxID 2) + parity-mismatch seed (slot 0 with odd TxID 1)
-	f.Add(encodeMetaPage(ps, 0, Meta{
-		Magic: metaMagic, Version: metaVersion, PageSize: ps,
+	f.Add(encodeMetaPage(c, ps, 0, Meta{
+		Magic: core.MetaMagic, Version: core.MetaVersion, PageSize: ps,
 		Root: 2, HighWater: 4, TxID: 2, Freelist: 3,
 	}), uint64(0))
-	f.Add(encodeMetaPage(ps, 0, Meta{
-		Magic: metaMagic, Version: metaVersion, PageSize: ps,
+	f.Add(encodeMetaPage(c, ps, 0, Meta{
+		Magic: core.MetaMagic, Version: core.MetaVersion, PageSize: ps,
 		Root: 2, HighWater: 4, TxID: 1, Freelist: 3,
 	}), uint64(0))
 
 	// Valid leaf page
-	if leaf, err := encodeLeafPage(ps, 2, 1, []LeafEntry{
+	if leaf, err := encodeLeafPage(c, ps, 2, 1, []LeafEntry{
 		{Key: []byte("a"), Value: []byte("1")},
 		{Key: []byte("b"), Value: []byte("2")},
 	}); err == nil {
@@ -32,7 +35,7 @@ func FuzzDecodePages(f *testing.F) {
 	}
 
 	// Valid branch page
-	if br, err := encodeBranchPage(ps, 3, 1, []BranchEntry{
+	if br, err := encodeBranchPage(c, ps, 3, 1, []BranchEntry{
 		{Key: []byte("a"), Child: 2},
 		{Key: []byte("m"), Child: 4},
 	}); err == nil {
@@ -40,7 +43,7 @@ func FuzzDecodePages(f *testing.F) {
 	}
 
 	// Valid freelist page
-	if fl, err := encodeFreelistPage(ps, 4, 2, 5, []PageID{2, 3}); err == nil {
+	if fl, err := encodeFreelistPage(c, ps, 4, 2, 5, []PageID{2, 3}); err == nil {
 		f.Add(fl, uint64(4))
 	}
 
@@ -51,34 +54,34 @@ func FuzzDecodePages(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, raw []byte, pgid uint64) {
 		id := PageID(pgid)
-		_, _ = decodeMetaPage(raw, id)
+		_, _ = decodeMetaPage(c, raw, id)
 
-		h, err := readAndVerifyPageHeader(raw, id)
+		h, err := verifyPageHeader(c, raw, id)
 		if err != nil {
 			// Also test decoders with synthetic headers even when CRC fails,
 			// exercising malformed count/length guards directly.
-			if len(raw) >= pageHeaderSize {
+			if len(raw) >= core.PageHeaderSize {
 				synth := PageHeader{
 					PGID:  id,
 					Flags: binary.LittleEndian.Uint16(raw[8:10]),
 					Count: binary.LittleEndian.Uint16(raw[10:12]),
 				}
-				_, _ = decodeLeafPage(raw, synth)
-				_, _ = decodeBranchPage(raw, synth)
-				_, _, _ = decodeFreelistPage(raw, synth)
+				_, _ = c.DecodeLeafPage(raw, synth)
+				_, _ = c.DecodeBranchPage(raw, synth)
+				_, _, _ = c.DecodeFreelistPage(raw, synth)
 			}
 			return
 		}
 
 		switch h.Flags {
 		case PageFlagMeta:
-			_, _ = decodeMetaPage(raw, id)
+			_, _ = decodeMetaPage(c, raw, id)
 		case PageFlagLeaf:
-			_, _ = decodeLeafPage(raw, h)
+			_, _ = c.DecodeLeafPage(raw, h)
 		case PageFlagBranch:
-			_, _ = decodeBranchPage(raw, h)
+			_, _ = c.DecodeBranchPage(raw, h)
 		case PageFlagFreelist:
-			_, _, _ = decodeFreelistPage(raw, h)
+			_, _, _ = c.DecodeFreelistPage(raw, h)
 		}
 	})
 }
@@ -88,6 +91,8 @@ func FuzzDecodePages(f *testing.F) {
 // (cycles, bad pointers, torn metas, unsorted leaves, truncated pages) are
 // always rejected cleanly with errors and never cause panics.
 func FuzzOpenCorruptStorage(f *testing.F) {
+	c := GoCore()
+
 	// Seed 1: fresh empty DB
 	stEmpty := NewMemStorage()
 	if db, err := OpenStorage(stEmpty, &Options{PageSize: 256}); err == nil {
@@ -120,9 +125,9 @@ func FuzzOpenCorruptStorage(f *testing.F) {
 	if db, err := OpenStorage(stCycle, &Options{PageSize: 256}); err == nil {
 		_ = db.Close()
 		img := stCycle.CloneDurable().working
-		brBuf, _ := encodeBranchPage(256, 2, 1, []BranchEntry{{Key: []byte("a"), Child: 2}})
-		metaBuf := encodeMetaPage(256, 1, Meta{
-			Magic: metaMagic, Version: metaVersion, PageSize: 256,
+		brBuf, _ := encodeBranchPage(c, 256, 2, 1, []BranchEntry{{Key: []byte("a"), Child: 2}})
+		metaBuf := encodeMetaPage(c, 256, 1, Meta{
+			Magic: core.MetaMagic, Version: core.MetaVersion, PageSize: 256,
 			Root: 2, HighWater: 3, TxID: 1,
 		})
 		applyWrite(&img, 256, metaBuf)

@@ -45,7 +45,7 @@ PY
 # Code Mutation 1: Omit storage.Sync() barrier inside SyncDataPages()
 run_code_mutation \
   "omit-sync-data-pages" \
-  "engine/tx.go" \
+  "engine/tx_commit.go" \
   '	if len(tx.dirty) > 0 && !tx.db.opts.NoSync {
 		if err := tx.db.storage.Sync(); err != nil {
 			return fmt.Errorf("groundkv: sync data pages: %w", err)
@@ -67,7 +67,7 @@ run_code_mutation \
 # Code Mutation 3: Omit alternate meta slot neutralization on Rollback after failed SyncMetaPage
 run_code_mutation \
   "omit-rollback-alt-meta-neutralize" \
-  "engine/tx.go" \
+  "engine/tx_commit.go" \
   '	if tx.writable && tx.phase >= CommitPhaseMetaWritten {
 		// WriteMetaPage already wrote nextMeta into the alternate meta slot in
 		// the OS page cache before SyncMetaPage failed. Overwrite that slot with
@@ -86,15 +86,19 @@ run_code_mutation \
 # Code Mutation 4: Replace byte-aware splitLeafEntries with naive midpoint split
 run_code_mutation \
   "midpoint-only-leaf-split" \
-  "engine/btree.go" \
-  'func splitLeafEntries(entries []LeafEntry, pageSize, maxKeys int) [][]LeafEntry {
-	bestMid := -1' \
-  'func splitLeafEntries(entries []LeafEntry, pageSize, maxKeys int) [][]LeafEntry {
+  "engine/gocore/btree.go" \
+  'func splitLeafEntries(entries []core.LeafEntry, pageSize, maxKeys int) [][]core.LeafEntry {
+	return splitEntries(entries, pageSize, maxKeys, func(e core.LeafEntry) int {
+		return core.LeafEntryHeaderSize + len(e.Key) + len(e.Value)
+	})
+}' \
+  'func splitLeafEntries(entries []core.LeafEntry, pageSize, maxKeys int) [][]core.LeafEntry {
 	if len(entries) >= 2 {
 		mid := len(entries) / 2
-		return [][]LeafEntry{entries[:mid], entries[mid:]}
+		return [][]core.LeafEntry{entries[:mid], entries[mid:]}
 	}
-	bestMid := -1' \
+	return [][]core.LeafEntry{entries}
+}' \
   "go test ./verify/dst -run '^TestDSTSwarm$' -dst-seeds=14 -dst-steps=200"
 
 echo "==> All 4 Go engine code mutation checks passed!"

@@ -4,13 +4,14 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
 
 ## Features
 
-- **Shared I/O Shell + Swappable Pure Kernel (`engine.Core`)**:
-  - **`engine/` (Pure Go — `engine.GoCore()`)**: zero-dependency Go stdlib COW B+Tree engine with fixed-size CRC32-checksummed pages, byte-aware 2-way & greedy multi-way splitting, root promotion & collapse, half-open `[start, end)` range scans, structural validation (`db.Validate()`), exclusive `flock` locking, and 4-phase crash-safe commits.
-  - **`engine/verified/` (Dafny-Verified Go — `verified.NewCore()`, `make dafny`)**: implements `engine.Core` (`PageCodec`, `MetaCore`, `BTreeCore`, `FreelistCore`/`FreelistPool`, `CommitCore`) backed directly by Z3-verified Dafny code translated to Go (encapsulated under `engine/verified/internal/dafnygen/`):
+- **Functional Core, Imperative Shell (Compiler-Enforced One-Way `engine ──▶ engine/core`)**:
+  - **`engine/core/` (Pure Contract)**: zero-I/O data types, wire constants, sentinel errors, and four domain interfaces aligned 1:1 with `formal/dafny/` (`Codec`, `BTreeNode`, `Freelist`/`FreelistPool`, `Protocol`) composed into a unified `Core` (+ `CompositeCore`).
+  - **`engine/gocore/` (Pure Go — `engine.GoCore()`)**: zero-dependency Go stdlib `core.Core` implementation importing only `engine/core` + stdlib.
+  - **`engine/verified/` (Dafny-Verified Go — `verified.NewCore()`, `make dafny`)**: symmetric peer `core.Core` implementation backed directly by Z3-verified Dafny code translated to Go (encapsulated under `engine/verified/internal/dafnygen/`):
     - **Phase 1 — Verified Pure Core** (`Types.dfy`, `PageCodec.dfy`, `BTreeNode.dfy`, `Freelist.dfy`): total-order byte comparison lemmas, little-endian Meta/Leaf/Branch/Freelist round-trip bijections, sorted `LeafGet`/`LeafPut`/`LeafDelete` KV-map refinement, `BranchChildIndex`, byte-aware 2-way + greedy multi-way splitting, MVCC `ReleaseBound`, and exact `ComputeFreelistPageCount` sufficiency & minimality.
     - **Phase 2 — Verified Full Tree & 4-Phase Storage Engine** (`BTree.dfy`, `StorageEngine.dfy`): end-to-end recursive COW B+Tree (`TreeGet`/`TreeScan`/`TreePut`/`TreeDelete`/`TreeValidate`) proving KV-map refinement & COW snapshot immutability, plus the 4-phase dual-meta commit protocol, `dirtyAltMeta` double-fault rollback fence, and crash-recovery refinement (`SelectRecoveredMeta`, `CrashRecoveryRefinesAtomicKV`, `DoubleFaultRollbackFenceSafety`).
     - Audited in CI (`make dafny`) for zero `assume` / `{:verify false}` / `{:axiom}` and bit-for-bit reproducibility of `engine/verified/internal/dafnygen/`.
-    - Select either kernel in Go (`engine.Open(...)` vs `verified.Open(...)` / `engine.Options{Core: verified.NewCore()}`) or in the CLI (`groundkv -engine go|verified`). Both share the exact same I/O/locking shell and bit-compatible on-disk format.
+    - Select either kernel in Go (`engine.Open(...)` vs `verified.Open(...)` / `engine.Options{Core: verified.NewCore()}`) or in the CLI (`groundkv -engine go|verified`). Both share the exact same I/O/locking shell (`engine/`) and bit-compatible on-disk format.
 - **Dual Meta Pages & Crash Recovery**: alternating meta pages (Page 0 and Page 1) with 4-phase `Sync`-ordered commits, `dirtyAltMeta` double-fault fencing, and automatic fallback on torn meta writes.
 - **MVCC Snapshot Isolation & Freelist Reclamation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer; freed pages are persisted as COW freelist chains and recycled strictly when `freeTxID <= min(txid-1, minActiveReaderTxID)`.
 - **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with exclusive `flock` locking and parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage`.
@@ -24,24 +25,28 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
 
 ```text
 groundkv/
-├── engine/                          # Shared I/O/locking shell + pure-Go Core (zero external deps)
-│   ├── core.go                      # Unified Core interface (composing 5 domain interfaces), CompositeCore & GoCore()
-│   ├── options.go                   # PageSize, MaxLeafKeys/MaxBranchKeys, NoFreelist, Tracer, Core, errors
-│   ├── storage.go                   # Storage interface, OSFileStorage (+ flock), fault-injecting MemStorage
+├── engine/                          # Imperative storage shell (one-way calls -> engine/core)
+│   ├── core/                        # Pure contract: types, errors, constants & 4 domain interfaces (zero impl/I/O)
+│   │   ├── types.go                 # PageID, PageHeader, Meta, LeafEntry, BranchEntry, CommitPhase, errors
+│   │   └── core.go                  # Codec, BTreeNode, Freelist/FreelistPool, Protocol, Core, CompositeCore
+│   ├── gocore/                      # Pure-Go core.Core peer implementation (imports only engine/core + stdlib)
+│   │   ├── core.go                  # gocore.New() composed pure-Go Core
+│   │   ├── codec.go / btree.go      # Pure-Go Codec & BTreeNode implementations
+│   │   └── freelist.go / protocol.go# Pure-Go Freelist/FreelistPool & Protocol implementations
+│   ├── verified/                    # Dafny-verified core.Core peer implementation (1:1 mirror of gocore/)
+│   │   ├── core.go                  # verified.NewCore(), verified.Open/OpenStorage
+│   │   ├── codec.go / btree.go      # Dafny Codec (PageCodec.dfy) & BTreeNode (BTreeNode.dfy) adapters
+│   │   ├── freelist.go / protocol.go# Dafny Freelist (Freelist.dfy) & Protocol (StorageEngine.dfy) adapters
+│   │   ├── internal/dafnygen/       # Generated Go packages translated from formal/dafny/*.dfy (encapsulated)
+│   │   ├── verified_test.go         # End-to-end, MVCC, crash-fence, CompositeCore & cross-engine interop tests
+│   │   └── phase2_test.go           # Direct Phase 2 GroundKVBTree & GroundKVEngine refinement tests
+│   ├── core.go / options.go / doc.go# Public type aliases, Options, errors & package overview
+│   ├── page.go / btree.go           # Zero-alloc CRC32 page framing & lazy on-disk COW B+Tree walker
+│   ├── db.go / inspect.go           # DB lifecycle/recovery & MBT/diagnostic inspection helpers
+│   ├── tx.go / tx_commit.go         # Tx KV API, COW page allocator, 4-phase commit pipeline & rollback fence
+│   ├── storage.go / memstorage.go   # Storage interface, OSFileStorage (+ flock) & fault-injecting MemStorage
 │   ├── trace.go                     # Zero-overhead-when-nil structured NDJSON protocol tracer
-│   ├── page.go / meta.go            # PageCodec & MetaCore interfaces + pure-Go implementations & CRC32 helpers
-│   ├── freelist.go                  # FreelistCore & FreelistPool interfaces + pure-Go pool & COW chain reader
-│   ├── btree.go                     # BTreeCore interface + pure-Go node ops & COW B+Tree traversal
-│   ├── tx.go / db.go                # CommitCore interface + MVCC read Tx, 4-phase COW write Tx & DB lifecycle
-│   ├── db_test.go / fuzz_test.go    # Unit, concurrency (-race), crash, freelist & native fuzz tests
-│   └── verified/                    # Dafny-verified Core package (bit-compatible with engine/)
-│       ├── core.go                  # verified.NewCore(), verified.Open/OpenStorage -> composed Dafny Core
-│       ├── page.go / meta.go        # Dafny PageCodec & MetaCore adapters (GroundKVCodec + GroundKVEngine)
-│       ├── btree.go / freelist.go   # Dafny BTreeCore & FreelistCore/FreelistPool adapters
-│       ├── tx.go                    # Dafny CommitCore adapter (4-phase transition guards)
-│       ├── internal/dafnygen/       # Generated Go packages translated from formal/dafny/*.dfy (encapsulated)
-│       ├── verified_test.go         # End-to-end, MVCC, crash-fence, CompositeCore & cross-engine interop tests
-│       └── phase2_test.go           # Direct Phase 2 GroundKVBTree & GroundKVEngine refinement tests
+│   └── db_test.go / fuzz_test.go    # Unit, concurrency (-race), crash, freelist & native fuzz tests
 ├── formal/                          # Unified formal methods (all 4 formal layers under one root)
 │   ├── fizzbee/                     # FizzBee specs (contract, storage_protocol, btree_ops)
 │   ├── tla/                         # Unbounded TLA+ protocol spec & TLC Trace Validation

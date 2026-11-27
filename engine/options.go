@@ -1,6 +1,10 @@
 package engine
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/flaneur2020/groundkv/engine/core"
+)
 
 const (
 	DefaultPageSize = 4096
@@ -8,16 +12,16 @@ const (
 )
 
 var (
-	ErrNotFound       = errors.New("groundkv: key not found")
+	ErrNotFound       = core.ErrNotFound
 	ErrTxClosed       = errors.New("groundkv: transaction closed")
 	ErrTxReadOnly     = errors.New("groundkv: transaction is read-only")
 	ErrDBClosed       = errors.New("groundkv: database closed")
-	ErrEmptyKey       = errors.New("groundkv: key must not be empty")
-	ErrKeyTooLarge    = errors.New("groundkv: key exceeds page capacity")
-	ErrValueTooLarge  = errors.New("groundkv: value exceeds page capacity")
-	ErrCorruptedMeta  = errors.New("groundkv: both meta pages are corrupted")
-	ErrCorruptedPage  = errors.New("groundkv: page checksum or format mismatch")
-	ErrWriteTxActive  = errors.New("groundkv: write transaction already active")
+	ErrEmptyKey       = core.ErrEmptyKey
+	ErrKeyTooLarge    = core.ErrKeyTooLarge
+	ErrValueTooLarge  = core.ErrValueTooLarge
+	ErrCorruptedMeta  = core.ErrCorruptedMeta
+	ErrCorruptedPage  = core.ErrCorruptedPage
+	ErrWriteTxActive  = core.ErrWriteTxActive
 	ErrInvalidOptions = errors.New("groundkv: invalid options")
 	ErrFileLocked     = errors.New("groundkv: database file is already locked")
 )
@@ -60,7 +64,7 @@ type Options struct {
 	// Core optionally selects the pure deterministic kernel implementation
 	// (binary codecs, B+Tree node operations & splits, MVCC freelist logic,
 	// dual-meta recovery selection, and commit phase guards).
-	// Nil defaults to GoCore() (pure Go stdlib). Pass verified.NewCore() to run
+	// Nil defaults to GoCore() (engine/gocore). Pass verified.NewCore() to run
 	// the Z3-verified Dafny-compiled implementation.
 	Core Core
 }

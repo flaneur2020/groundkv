@@ -459,11 +459,10 @@ func TestCompositeCoreMixAndMatch(t *testing.T) {
 	dafnyCore := verified.NewCore()
 
 	hybrid := engine.CompositeCore{
-		PageCodec:    goCore,
-		MetaCore:     dafnyCore,
-		BTreeCore:    dafnyCore,
-		FreelistCore: dafnyCore,
-		CommitCore:   goCore,
+		Codec:     goCore,
+		BTreeNode: dafnyCore,
+		Freelist:  dafnyCore,
+		Protocol:  goCore,
 	}
 
 	st := engine.NewMemStorage()

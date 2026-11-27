@@ -70,7 +70,7 @@ fi
 COVER_FLAGS=""
 if [ -n "${MBT_COVER_DIR:-}" ]; then
   mkdir -p "$MBT_COVER_DIR"
-  COVER_FLAGS="-coverpkg=./engine -coverprofile=${MBT_COVER_DIR}/mbt_${SUITE_NAME}.out"
+  COVER_FLAGS="-coverpkg=./engine,./engine/core,./engine/gocore -coverprofile=${MBT_COVER_DIR}/mbt_${SUITE_NAME}.out"
 fi
 
 echo "==> Running FizzBee MBT suite: ${SUITE_NAME} (${GO_PKG} -run ^${TEST_FUNC}$ ${GO_TEST_FLAGS:-} ${COVER_FLAGS})"

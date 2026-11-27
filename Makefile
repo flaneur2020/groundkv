@@ -60,19 +60,19 @@ scaffold-interfaces:
 	$(FIZZ) mbt-scaffold --lang go --go-package btree_ops_mbt --out-dir verify/mbt/btree_ops $(BTREE_OPS_SPEC)
 	gofmt -w verify/mbt/contract verify/mbt/storage_protocol verify/mbt/btree_ops
 
-## test: Run pure-Go engine and Dafny-verified Core tests
+## test: Run pure-Go engine, core/gocore, and Dafny-verified Core tests
 test:
-	go test -v ./engine ./engine/verified
+	go test -v ./engine ./engine/core ./engine/gocore ./engine/verified
 
-## race: Run pure-Go engine, Dafny-verified Core, and concurrent linearizability tests under -race
+## race: Run pure-Go engine, core/gocore, Dafny-verified Core, and linearizability tests under -race
 race:
-	go test -race -v ./engine ./engine/verified
+	go test -race -v ./engine ./engine/core ./engine/gocore ./engine/verified
 	go test -race -v -run TestConcurrentLinearizability ./verify/dst
 
 ## dst: Run Deterministic Simulation Testing (7 Swarm profiles, 19 scenario checks, SIGKILL crash recovery & linearizability)
 dst:
 	mkdir -p $(MBT_COVER_DIR)
-	go test -v -coverpkg=./engine -coverprofile=$(MBT_COVER_DIR)/dst.out ./verify/dst/...
+	go test -v -coverpkg=./engine,./engine/core,./engine/gocore -coverprofile=$(MBT_COVER_DIR)/dst.out ./verify/dst/...
 
 ## fuzz: Run deterministic Go mutation fuzzing on binary page decoders and corrupt disk images
 fuzz:
@@ -111,7 +111,7 @@ mbt-coverage:
 ## combined-coverage: Merge MBT + DST + fuzz-seed profiles and report combined ./engine statement coverage
 combined-coverage:
 	mkdir -p $(MBT_COVER_DIR)
-	go test -coverpkg=./engine -coverprofile=$(MBT_COVER_DIR)/fuzz_seeds.out -run '^Fuzz' ./engine
+	go test -coverpkg=./engine,./engine/core,./engine/gocore -coverprofile=$(MBT_COVER_DIR)/fuzz_seeds.out -run '^Fuzz' ./engine
 	python3 ./scripts/merge_coverage.py $(MBT_COVER_DIR)/combined.out \
 		$(MBT_COVER_DIR)/mbt_contract.out \
 		$(MBT_COVER_DIR)/mbt_storage_protocol.out \
