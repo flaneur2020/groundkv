@@ -4,9 +4,9 @@ import (
 	"fmt"
 
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
-	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVCodec"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVTypes"
+	_dafny "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/dafny"
 )
 
 type dafnyPageCodec struct{}

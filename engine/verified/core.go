@@ -1,6 +1,6 @@
 // Package verified provides GroundKV's Dafny-verified storage kernel
 // (`engine.Core`) backed by Z3-verified Dafny code translated to Go under
-// verified/internal/dafnygen.
+// engine/verified/internal/dafnygen.
 //
 // Each domain sub-interface of engine.Core is implemented in its matching file:
 //   - page.go:     engine.PageCodec    (GroundKVCodec header/leaf/branch)
@@ -16,7 +16,7 @@ package verified
 
 import (
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVTypes"
 )
 
 type dafnyCore struct {

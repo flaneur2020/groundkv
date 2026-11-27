@@ -2,7 +2,7 @@ package verified
 
 import (
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVEngine"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVEngine"
 )
 
 type dafnyCommitCore struct{}

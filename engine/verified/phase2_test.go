@@ -7,10 +7,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVBTree"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVEngine"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
-	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVBTree"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVEngine"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVTypes"
+	_dafny "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/dafny"
 )
 
 // TestPhase2VerifiedCOWBTreeRefinement directly exercises the Phase 2 Z3-verified

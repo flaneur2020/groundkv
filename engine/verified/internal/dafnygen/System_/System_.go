@@ -6,7 +6,7 @@
 package _System
 
 import (
-	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
+	_dafny "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/dafny"
 	os "os"
 )
 

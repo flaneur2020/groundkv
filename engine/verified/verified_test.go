@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified"
+	"github.com/flaneur2020/groundkv/engine/verified"
 )
 
 func TestVerifiedBasicCRUDAndPersistence(t *testing.T) {

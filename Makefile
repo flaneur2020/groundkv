@@ -45,11 +45,11 @@ trace-validate:
 prove:
 	./scripts/check_lean_proofs.sh
 
-## dafny: Verify all Phase 1 & Phase 2 Dafny proofs, audit zero bypasses, and check verified/internal/dafnygen/ reproducibility
+## dafny: Verify all Phase 1 & Phase 2 Dafny proofs, audit zero bypasses, and check engine/verified/internal/dafnygen/ reproducibility
 dafny:
 	./scripts/check_dafny.sh
 
-## dafny-build: Verify Dafny proofs and regenerate verified/internal/dafnygen/ Go packages
+## dafny-build: Verify Dafny proofs and regenerate engine/verified/internal/dafnygen/ Go packages
 dafny-build:
 	./scripts/build_dafny.sh
 
@@ -62,11 +62,11 @@ scaffold-interfaces:
 
 ## test: Run pure-Go engine and Dafny-verified Core tests
 test:
-	go test -v ./engine/... ./verified
+	go test -v ./engine ./engine/verified
 
 ## race: Run pure-Go engine, Dafny-verified Core, and concurrent linearizability tests under -race
 race:
-	go test -race -v ./engine/... ./verified
+	go test -race -v ./engine ./engine/verified
 	go test -race -v -run TestConcurrentLinearizability ./verify/dst
 
 ## dst: Run Deterministic Simulation Testing (7 Swarm profiles, 19 scenario checks, SIGKILL crash recovery & linearizability)

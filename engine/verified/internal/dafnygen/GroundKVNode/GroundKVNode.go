@@ -8,12 +8,12 @@ package GroundKVNode
 import (
 	os "os"
 
-	m_GroundKVCodec "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVCodec"
-	m_GroundKVEngine "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVEngine"
-	m_GroundKVFreelist "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVFreelist"
-	m_GroundKVTypes "github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVTypes"
-	m__System "github.com/flaneur2020/groundkv/verified/internal/dafnygen/System_"
-	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
+	m_GroundKVCodec "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVCodec"
+	m_GroundKVEngine "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVEngine"
+	m_GroundKVFreelist "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVFreelist"
+	m_GroundKVTypes "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVTypes"
+	m__System "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/System_"
+	_dafny "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/dafny"
 )
 
 var _ = os.Args

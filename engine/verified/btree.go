@@ -2,8 +2,8 @@ package verified
 
 import (
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified/internal/dafnygen/GroundKVNode"
-	_dafny "github.com/flaneur2020/groundkv/verified/internal/dafnygen/dafny"
+	"github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/GroundKVNode"
+	_dafny "github.com/flaneur2020/groundkv/engine/verified/internal/dafnygen/dafny"
 )
 
 type dafnyBTreeCore struct{}

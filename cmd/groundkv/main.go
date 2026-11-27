@@ -7,7 +7,7 @@ import (
 	"os"
 
 	"github.com/flaneur2020/groundkv/engine"
-	"github.com/flaneur2020/groundkv/verified"
+	"github.com/flaneur2020/groundkv/engine/verified"
 )
 
 func openDB(impl, path string) (*engine.DB, error) {
