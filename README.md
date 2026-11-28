@@ -1,37 +1,19 @@
 # GroundKV
 
-A zero-dependency, BoltDB-inspired embedded KV store in Go built on a **copy-on-write (COW) B+Tree** with **MVCC reader-aware freelist reclamation**, dual-meta crash recovery, and multi-layer formal verification (**Quint**, **Lean 4**, **Dafny**).
+A zero-dependency, BoltDB-inspired embedded append only B+Tree KV store in Go, designed with **Model-Based Testing (MBT) as a first-class citizen**.
 
-## Highlights
-
-- **Functional Core, Imperative Shell**: `engine/` handles I/O, `flock`, locking, CRC32 framing, and 4-phase commits, calling strictly one-way into `engine/core.Core`.
-- **Swappable Verified Kernel**: Choose between pure-Go `engine.GoCore()` (`engine/gocore/`) and Z3-verified Dafny-compiled `verified.NewCore()` (`engine/verified/`, 1,027 VCs, 0 `assume`) — same I/O shell, bit-compatible on-disk format.
-- **Verification Stack**:
-  - **Quint (`formal/quint/`, `verify/mbt/`)**: protocol & B+Tree specs, 5 spec mutations, DST trace validation, and ITF MBT against both kernels.
-  - **Lean 4 (`formal/lean/`)**: 13 unbounded machine-checked theorems (0 `sorry`).
-  - **Dafny (`formal/dafny/`)**: verified codecs, B+Tree, freelist, and engine protocol compiled to Go.
-  - **DST & Fuzzing (`verify/dst/`, `engine/fuzz_test.go`)**: 7 Swarm profiles, 64B `SimDisk` crashes, `SIGKILL` recovery, `-race` linearizability, Go code mutations, and native fuzzing.
-
-See [docs/architecture.md](docs/architecture.md) for the on-disk layout, `Core` boundary, and verification details.
-
-## Layout
+- **MBT-First Design**: Fault-injectable `Storage`, configurable fanout caps, and white-box inspection APIs let executable **Quint** specs (`formal/quint/`) directly drive the real engine via ITF MBT (`verify/mbt/`) and validate real DST traces with zero shadow state.
+- **Swappable Core**: `engine/` (I/O, `flock`, CRC32, 4-phase commits) calls one-way into `engine/core.Core` — choose pure-Go `engine.GoCore()` or Dafny-verified `verified.NewCore()`.
+- **Deep Verification**: Quint MBT/trace validation/mutations, Swarm DST (`SimDisk`, `SIGKILL`, `-race` linearizability), native fuzzing, plus Dafny & Lean proofs. See [docs/architecture.md](docs/architecture.md).
 
 ```text
-engine/     # Imperative shell + core/ (interfaces), gocore/ (Go), verified/ (Dafny)
-formal/     # quint/ (specs & traces), lean/ (unbounded proofs), dafny/ (Go codegen)
-verify/     # dst/ (Swarm DST, SIGKILL, linearizability) & mbt/ (Quint ITF MBT)
-cmd/        # groundkv CLI (-engine go|verified) & groundkv-dst runner
+engine/   # Shell + core/ (interfaces), gocore/ (Go), verified/ (Dafny)
+formal/   # quint/ (MBT & trace specs), dafny/ (Go codegen), lean/ (proofs)
+verify/   # mbt/ (Quint ITF MBT) & dst/ (Swarm DST, SIGKILL, linearizability)
+cmd/      # groundkv CLI (-engine go|verified) & groundkv-dst
 ```
 
-## Quick Start
-
 ```bash
-make help        # List all targets
-make verify      # Run Dafny, Lean 4, Quint (specs/mutations/trace/MBT), DST, race & code mutations
-make fuzz        # Run deterministic Go fuzzers
-make build       # Build bin/groundkv and bin/groundkv-dst
-
-./bin/groundkv -db demo.db -engine go put hello world
-./bin/groundkv -db demo.db -engine verified get hello
-./bin/groundkv -db demo.db -engine verified verify
+make mbt && make verify   # Run Quint MBT and full verification suite (`make help` for all targets)
+make build && ./bin/groundkv -db demo.db -engine verified put hello world
 ```
