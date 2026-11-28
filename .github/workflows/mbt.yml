@@ -1,4 +1,4 @@
-name: FizzBee MBT & Engine CI
+name: GroundKV Verification CI
 
 on:
   push:
@@ -10,13 +10,12 @@ permissions:
   contents: read
 
 env:
-  FIZZBEE_VERSION: "0.5.4"
-  FIZZBEE_MBT_VERSION: "0.2.0"
+  QUINT_VERSION: "0.35.0"
   DAFNY_VERSION: "4.11.0"
 
 jobs:
-  mbt:
-    name: Model Check, Engine Race Tests & FizzBee MBT
+  verify:
+    name: Dafny, Lean 4, Quint (Specs/Trace/MBT), DST, Race & Fuzz CI
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -28,43 +27,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Cache FizzBee & FizzBee-MBT binaries
-        id: cache-fizzbee
-        uses: actions/cache@v4
+      - name: Set up Node.js (for Quint)
+        uses: actions/setup-node@v4
         with:
-          path: ~/.local/fizzbee-tools
-          key: fizzbee-${{ env.FIZZBEE_VERSION }}-mbt-${{ env.FIZZBEE_MBT_VERSION }}-linux_x86
+          node-version: "22"
 
-      - name: Install FizzBee & FizzBee-MBT
-        if: steps.cache-fizzbee.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          TOOLS_DIR="$HOME/.local/fizzbee-tools"
-          mkdir -p "$TOOLS_DIR"
-
-          curl -fsSL \
-            "https://github.com/fizzbee-io/fizzbee/releases/download/v${FIZZBEE_VERSION}/fizzbee-v${FIZZBEE_VERSION}-linux_x86.tar.gz" \
-            -o /tmp/fizzbee.tar.gz
-          tar -xzf /tmp/fizzbee.tar.gz -C "$TOOLS_DIR"
-          rm -f /tmp/fizzbee.tar.gz
-
-          curl -fsSL \
-            "https://github.com/fizzbee-io/fizzbee-mbt-releases/releases/download/v${FIZZBEE_MBT_VERSION}/fizzbee-mbt-${FIZZBEE_MBT_VERSION}-linux_x86.tar.gz" \
-            -o /tmp/fizzbee-mbt.tar.gz
-          tar -xzf /tmp/fizzbee-mbt.tar.gz -C "$TOOLS_DIR"
-          rm -f /tmp/fizzbee-mbt.tar.gz
-
-      - name: Add FizzBee tools to PATH
-        run: |
-          TOOLS_DIR="$HOME/.local/fizzbee-tools"
-          echo "$TOOLS_DIR/fizzbee-v${FIZZBEE_VERSION}-linux_x86" >> "$GITHUB_PATH"
-          echo "$TOOLS_DIR/fizzbee-mbt-${FIZZBEE_MBT_VERSION}-linux_x86" >> "$GITHUB_PATH"
-
-      - name: Cache TLA+ tools (tla2tools + CommunityModules)
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/tla-tools
-          key: tla-tools-1.8.0-community-v1
+      - name: Install Quint CLI
+        run: npm install -g "@informalsystems/quint@${QUINT_VERSION}"
 
       - name: Cache Lean 4 toolchain (elan v4.16.0)
         id: cache-lean
@@ -118,8 +87,8 @@ jobs:
 
       - name: Go vet
         run: |
-          go vet ./engine ./engine/core/... ./engine/gocore/... ./verify/... ./cmd/groundkv-dst/...
-          go vet -unreachable=false ./engine/verified/... ./cmd/groundkv/...
+          go vet ./engine ./engine/core/... ./engine/gocore/... ./verify/dst/... ./cmd/groundkv-dst/...
+          go vet -unreachable=false ./engine/verified/... ./verify/mbt/... ./cmd/groundkv/...
 
       - name: Engine unit, crash-recovery, fuzz-seed & race tests
         run: make race
@@ -130,17 +99,17 @@ jobs:
       - name: Go-side engine code mutation proofs
         run: make check-code-mutations
 
-      - name: TLA+ protocol model checking & Formal Trace Validation on real Go DST traces
+      - name: Quint formal spec checks (typecheck, scenario tests & invariant simulation)
+        run: make check-specs
+
+      - name: Quint formal spec mutation proofs (5 protocol bugs)
+        run: make check-mutations
+
+      - name: Quint Trace Validation on real Go DST traces (8 traces + 2 negative controls)
         run: make trace-validate
+
+      - name: Quint ITF Model-Based Testing (-race + coverage against GoCore & VerifiedDafnyCore)
+        run: make mbt combined-coverage
 
       - name: Active Go Fuzzing (page decoders & corrupt storage images)
         run: make fuzz
-
-      - name: Model-check all FizzBee specs (safety & liveness)
-        run: make FIZZ=fizz check-specs
-
-      - name: Run formal spec mutation checks (4 safety + 1 liveness)
-        run: make FIZZ=fizz check-mutations
-
-      - name: Run FizzBee Model-Based Testing (-race + MBT & combined coverage)
-        run: make FIZZ=fizz FIZZBEE_MBT_SERVER=fizzbee-mbt-server FIZZBEE_MBT_BIN=fizzbee-mbt-runner mbt-contract mbt-storage-protocol mbt-btree-ops mbt-coverage combined-coverage

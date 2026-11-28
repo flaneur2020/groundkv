@@ -8,7 +8,7 @@ import (
 
 // Storage abstracts the underlying page-addressable file store so GroundKV can
 // run on real OS files in production and on deterministic, crash-injectable
-// storage in unit tests, DST, and FizzBee MBT harnesses.
+// storage in unit tests, DST, and Quint MBT harnesses.
 type Storage interface {
 	ReadAt(p []byte, off int64) (int, error)
 	WriteAt(p []byte, off int64) (int, error)

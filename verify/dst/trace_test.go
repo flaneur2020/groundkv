@@ -11,7 +11,7 @@ import (
 
 // TestExportDSTTraces runs representative Swarm Testing profiles with
 // engine.JSONLineTracer enabled and exports NDJSON protocol execution traces
-// for formal TLA+ Trace Validation (formal/tla/GroundKVTrace.tla).
+// for formal Quint Trace Validation (formal/quint/trace_protocol.qnt).
 // When GROUNDKV_TRACE_DIR is unset, it writes to t.TempDir() to smoke-test
 // tracing cleanly during regular go test runs.
 func TestExportDSTTraces(t *testing.T) {

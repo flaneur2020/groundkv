@@ -13,7 +13,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 setup_copy() {
   local dest="$1"
   mkdir -p "$dest/verify"
-  cp "$ROOT_DIR/go.mod" "$ROOT_DIR/go.sum" "$dest/"
+  cp "$ROOT_DIR/go.mod" "$dest/"
   cp -r "$ROOT_DIR/engine" "$dest/"
   cp -r "$ROOT_DIR/verify/dst" "$dest/verify/"
 }

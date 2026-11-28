@@ -1,59 +1,115 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs TLA+ formal model checking of GroundKVProtocol.tla AND TLA+ Trace Validation
-# (GroundKVTrace.tla) against real NDJSON execution traces exported from GroundKV's
-# Go engine during DST swarm simulations (plus a negative-control corrupt trace).
+# Runs Quint formal checking of formal/quint/trace_protocol.qnt AND Quint Trace
+# Validation against real NDJSON execution traces exported from GroundKV's Go
+# engine during DST swarm simulations (plus 2 negative-control corrupt traces).
 
-TLA_TOOLS_DIR="${TLA_TOOLS_DIR:-$HOME/.local/tla-tools}"
-TLA_VERSION="${TLA_VERSION:-1.8.0}"
-TLA_JAR="${TLA_TOOLS_DIR}/tla2tools.jar"
-CM_JAR="${TLA_TOOLS_DIR}/CommunityModules-deps.jar"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QUINT="${QUINT:-$(command -v quint || echo "$HOME/.local/bin/quint")}"
+QUINT_BACKEND="${QUINT_BACKEND:-typescript}"
+SPEC="${ROOT_DIR}/formal/quint/trace_protocol.qnt"
 
-mkdir -p "$TLA_TOOLS_DIR"
-if [ ! -f "$TLA_JAR" ]; then
-  echo "==> Downloading tla2tools.jar (v${TLA_VERSION})"
-  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
-    "https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar" -o "${TLA_JAR}.tmp"
-  mv "${TLA_JAR}.tmp" "$TLA_JAR"
-fi
-if [ ! -f "$CM_JAR" ]; then
-  echo "==> Downloading CommunityModules-deps.jar"
-  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
-    "https://github.com/tlaplus/CommunityModules/releases/latest/download/CommunityModules-deps.jar" -o "${CM_JAR}.tmp"
-  mv "${CM_JAR}.tmp" "$CM_JAR"
-fi
-
-CP="${TLA_JAR}:${CM_JAR}"
-WORK_DIR="$(mktemp -d /tmp/groundkv-tla-trace-XXXXXX)"
+WORK_DIR="$(mktemp -d /tmp/groundkv-quint-trace-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "==> 1. Model-checking unbounded TLA+ protocol spec (formal/tla/GroundKVProtocol.tla)"
-java -XX:+UseParallelGC -cp "$CP" tlc2.TLC \
-  -workers auto -cleanup -metadir "${WORK_DIR}/mc-meta" \
-  -config formal/tla/GroundKVProtocol_MC.cfg \
-  formal/tla/GroundKVProtocol.tla
+echo "==> 1. Typechecking & simulating formal/quint/trace_protocol.qnt"
+"$QUINT" typecheck "$SPEC"
+"$QUINT" run --backend="$QUINT_BACKEND" \
+  --invariant=inv_all \
+  --max-samples=500 \
+  --max-steps=25 \
+  --seed=0x2026 \
+  --verbosity=1 \
+  "$SPEC"
 
 echo "==> 2. Exporting real Go execution traces from DST swarm seeds"
 TRACE_DIR="${WORK_DIR}/traces"
 mkdir -p "$TRACE_DIR"
 GROUNDKV_TRACE_DIR="$TRACE_DIR" go test -v ./verify/dst -run '^TestExportDSTTraces$'
 
-echo "==> 3. Running TLA+ Trace Validation against every real Go execution trace"
+# Copy trace_protocol.qnt into WORK_DIR so generated trace modules can import it cleanly.
+cp "$SPEC" "${WORK_DIR}/trace_protocol.qnt"
+
+generate_trace_qnt() {
+  local ndjson_path="$1"
+  local out_qnt="$2"
+  python3 - "$ndjson_path" "$out_qnt" <<'PY'
+import json, sys
+
+ndjson_path, out_qnt = sys.argv[1], sys.argv[2]
+events = [json.loads(line) for line in open(ndjson_path) if line.strip()]
+assert len(events) >= 1, f"empty trace: {ndjson_path}"
+
+def fmt_obs(ev):
+    pending = ", ".join(str(x) for x in ev.get("pending_txids", []))
+    dirty = "true" if ev["dirty_alt_meta"] else "false"
+    return (
+        f'{{ event: "{ev["event"]}", '
+        f'txid: {ev["txid"]}, '
+        f'phase: "{ev["phase"]}", '
+        f'root: {ev["root"]}, '
+        f'freelist: {ev["freelist"]}, '
+        f'highWater: {ev["high_water"]}, '
+        f'dirtyAltMeta: {dirty}, '
+        f'activeReaders: {ev["active_readers"]}, '
+        f'minReaderTxID: {ev["min_reader_txid"]}, '
+        f'pendingTxIDs: Set({pending}), '
+        f'releaseBound: {ev["release_bound"]} }}'
+    )
+
+lines = [
+    "module trace_check {",
+    '  import trace_protocol.* from "./trace_protocol"',
+    "",
+    "  var traceIdx: int",
+    "",
+    "  pure val traceEvents: List[TraceObs] = [",
+]
+for ev in events:
+    lines.append(f"    {fmt_obs(ev)},")
+lines += [
+    "  ]",
+    "",
+    "  action initCursor = all {",
+    "    traceInit(traceEvents[0]),",
+    "    traceIdx' = 1,",
+    "  }",
+    "",
+    "  action stepCursor = all {",
+    "    traceIdx < traceEvents.length(),",
+    "    traceDispatch(traceEvents[traceIdx]),",
+    "    traceIdx' = traceIdx + 1,",
+    "  }",
+    "",
+    "  run validateTraceTest = {",
+    "    initCursor",
+    "      .expect(matchesObserved(traceEvents[0]))",
+    f"      .then(reps({len(events) - 1}, _ => stepCursor.expect(matchesObserved(traceEvents[traceIdx - 1]))))",
+    "      .expect(traceIdx == traceEvents.length())",
+    "  }",
+    "}",
+]
+
+with open(out_qnt, "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+}
+
+echo "==> 3. Running Quint Trace Validation against every real Go execution trace"
 count=0
 for trace in "${TRACE_DIR}"/*.ndjson; do
   base="$(basename "$trace")"
   lines="$(wc -l < "$trace")"
+  qnt_file="${WORK_DIR}/check_${count}.qnt"
+  generate_trace_qnt "$trace" "$qnt_file"
   echo "    Validating ${base} (${lines} protocol transitions)..."
-  TRACE_PATH="$trace" java -XX:+UseParallelGC -cp "$CP" tlc2.TLC \
-    -workers 1 -cleanup -metadir "${WORK_DIR}/meta-${base}" \
-    -config formal/tla/GroundKVTrace.cfg \
-    formal/tla/GroundKVTrace.tla > "${WORK_DIR}/${base}.log" 2>&1 || {
-      echo "    ERROR: TLA+ Trace Validation FAILED on ${base}!" >&2
-      tail -n 40 "${WORK_DIR}/${base}.log" >&2
-      exit 1
-    }
-  echo "    OK: ${base} accepted by GroundKVProtocol"
+  "$QUINT" test --backend="$QUINT_BACKEND" --max-samples=1 "$qnt_file" > "${WORK_DIR}/${base}.log" 2>&1 || {
+    echo "    ERROR: Quint Trace Validation FAILED on ${base}!" >&2
+    tail -n 40 "${WORK_DIR}/${base}.log" >&2
+    exit 1
+  }
+  echo "    OK: ${base} accepted by trace_protocol.qnt"
   count=$((count + 1))
 done
 if [ "$count" -eq 0 ]; then
@@ -61,7 +117,7 @@ if [ "$count" -eq 0 ]; then
   exit 1
 fi
 
-echo "==> 4. Negative-control checks: corrupted traces must be REJECTED by TLA+"
+echo "==> 4. Negative-control checks: corrupted traces must be REJECTED by Quint"
 FIRST_TRACE="$(ls "${TRACE_DIR}"/*.ndjson | head -n 1)"
 BAD_RESURRECT="${WORK_DIR}/bad_resurrected.ndjson"
 BAD_WATERMARK="${WORK_DIR}/bad_watermark.ndjson"
@@ -91,15 +147,14 @@ PY
 
 for bad_file in "$BAD_RESURRECT" "$BAD_WATERMARK"; do
   bname="$(basename "$bad_file")"
-  if TRACE_PATH="$bad_file" java -XX:+UseParallelGC -cp "$CP" tlc2.TLC \
-    -workers 1 -cleanup -noGenerateSpecTE -metadir "${WORK_DIR}/meta-${bname}" \
-    -config formal/tla/GroundKVTrace.cfg \
-    formal/tla/GroundKVTrace.tla > "${WORK_DIR}/${bname}.log" 2>&1; then
-    echo "    ERROR: negative-control trace '${bname}' was NOT rejected by TLA+!" >&2
+  bad_qnt="${WORK_DIR}/check_${bname}.qnt"
+  generate_trace_qnt "$bad_file" "$bad_qnt"
+  if "$QUINT" test --backend="$QUINT_BACKEND" --max-samples=1 "$bad_qnt" > "${WORK_DIR}/${bname}.log" 2>&1; then
+    echo "    ERROR: negative-control trace '${bname}' was NOT rejected by Quint!" >&2
     exit 1
   else
-    echo "    OK: ${bname} rejected by TLA+ Trace Validation"
+    echo "    OK: ${bname} rejected by Quint Trace Validation"
   fi
 done
 
-echo "==> TLA+ model checking & trace validation PASSED (${count} real traces verified)!"
+echo "==> Quint protocol simulation & trace validation PASSED (${count} real traces verified)!"

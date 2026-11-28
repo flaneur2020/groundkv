@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Negative-control mutation tests for formal/fizzbee/storage_protocol/storage_protocol.fizz.
-# Ensures formal safety AND liveness invariants genuinely catch protocol bugs and never drift into tautologies.
+# Negative-control mutation proofs for formal/quint/storage_protocol.qnt.
+# Injects 5 real storage-protocol bugs into temporary copies of the Quint spec
+# and proves that Quint's invariants catch EVERY single violation.
 
-FIZZ="${FIZZ:-$(command -v fizz || echo "$HOME/bin/fizzbee-v0.5.4-linux_x86/fizz")}"
-SPEC="formal/fizzbee/storage_protocol/storage_protocol.fizz"
+QUINT="${QUINT:-$(command -v quint || echo "$HOME/.local/bin/quint")}"
+QUINT_BACKEND="${QUINT_BACKEND:-typescript}"
+SPEC="formal/quint/storage_protocol.qnt"
 
-TMPDIR="$(mktemp -d /tmp/groundkv-mutations-XXXXXX)"
+TMPDIR="$(mktemp -d /tmp/groundkv-quint-mutations-XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 python3 - "$SPEC" "$TMPDIR" <<'PY'
@@ -17,63 +19,72 @@ spec_path, out_dir = sys.argv[1], sys.argv[2]
 src = open(spec_path).read()
 
 mutations = [
-    # Mutation 1 (Safety): Omit disk.Sync() barrier between DATA_WRITTEN and DATA_SYNCED.
+    # Mutation 1: Omit disk.Sync() barrier in syncDataPages
     (
         "m1",
-        "            if self.tx_dirty_written or self.tx_fl_written:\n                disk.Sync()",
-        "            pass",
+        "    val doSync = txDirtyWritten or txFlWritten",
+        "    val doSync = false",
     ),
-    # Mutation 2 (Safety): Ignore active MVCC reader txid in freelist release_bound().
+    # Mutation 2: Ignore active MVCC reader watermark in calcReleaseBound
     (
         "m2",
-        "        if self.has_reader and self.reader_txid < bound:\n            bound = self.reader_txid",
-        "        pass",
+        "    if (readerOpen and rTx < base) rTx else base",
+        "    base",
     ),
-    # Mutation 3 (Safety): Omit disk.InvalidateMeta() on failed SyncMetaPage rollback.
+    # Mutation 3: Omit InvalidateMeta on failed SyncMetaPage rollback
     (
         "m3",
-        "            if inval_ok:\n                disk.InvalidateMeta(next_txid % 2)\n                self.dirty_alt_meta = False",
-        "            if inval_ok:\n                self.dirty_alt_meta = False",
+        "      val nextPM =\n        if (invalOk) {\n          present: true, valid: false, slot: nextTx % 2,\n          txid: 0, root: 0, fl: 0, expected: NOT_FOUND\n        } else pendingMeta",
+        "      val nextPM = pendingMeta",
     ),
-    # Mutation 4 (Safety): Omit SyncDataPages() dirty_alt_meta fence before disk.Sync().
+    # Mutation 4: Omit SyncDataPages dirtyAltMeta fence before fsync
     (
         "m4",
-        "            if self.dirty_alt_meta:\n                disk.InvalidateMeta((self.txid + 1) % 2)\n                self.dirty_alt_meta = False",
-        "            pass",
+        "    val pmAfterFence =\n      if (dirtyAltMeta) {\n        present: true, valid: false, slot: (txid + 1) % 2,\n        txid: 0, root: 0, fl: 0, expected: NOT_FOUND\n      } else pendingMeta",
+        "    val pmAfterFence = pendingMeta",
     ),
-    # Mutation 5 (Liveness): Omit release_eligible() when closing an MVCC reader.
+    # Mutation 5: Omit releaseFromPending when closing an MVCC reader
     (
         "m5",
-        "        self.reader_expected = NOT_FOUND\n        self.release_eligible()",
-        "        self.reader_expected = NOT_FOUND",
+        "    val bound = calcReleaseBound(txid, false, -1)\n    val rel = releaseFromPending(freePages, pendingFree, bound)",
+        "    val bound = calcReleaseBound(txid, false, -1)\n    val rel = { free: freePages, pending: pendingFree }",
     ),
 ]
 
 for key, target, repl in mutations:
     assert target in src, f"Mutation {key} target snippet not found in {spec_path}"
-    sub = os.path.join(out_dir, key)
-    os.makedirs(sub, exist_ok=True)
-    open(os.path.join(sub, f"{key}.fizz"), "w").write(src.replace(target, repl, 1))
+    open(os.path.join(out_dir, f"{key}.qnt"), "w").write(src.replace(target, repl, 1))
 PY
 
 check_mutation() {
-  local name="$1" file="$2" expected_inv="$3" out="$4"
-  echo "==> Running mutation check: ${name} (expecting ${expected_inv} to FAIL)"
-  mkdir -p "$out"
-  local log="${out}/run.log"
-  "$FIZZ" --output-dir "$out" "$file" > "$log" 2>&1 || true
-  if grep -Eq "(FAILED: Model checker failed\. Invariant:.*${expected_inv}|Invariant: ${expected_inv})" "$log"; then
-    echo "    OK: caught expected violation (${expected_inv})"
-  else
+  local name="$1" file="$2" expected_inv="$3"
+  echo "==> Running Quint spec mutation check: ${name} (expecting ${expected_inv} to FAIL)"
+  local log="${TMPDIR}/${name}.log"
+  if "$QUINT" run --backend="$QUINT_BACKEND" \
+      --main=storage_protocol \
+      --invariant="$expected_inv" \
+      --max-samples=3000 \
+      --max-steps=60 \
+      --seed=0x42 \
+      --verbosity=1 \
+      "$file" > "$log" 2>&1; then
     echo "    ERROR: mutation '${name}' was NOT caught by ${expected_inv}!" >&2
     tail -n 30 "$log" >&2
     exit 1
+  else
+    if grep -qiE "(violation|violated|counterexample)" "$log"; then
+      echo "    OK: caught expected violation (${expected_inv})"
+    else
+      echo "    ERROR: '${name}' failed unexpectedly without an invariant violation:" >&2
+      tail -n 30 "$log" >&2
+      exit 1
+    fi
   fi
 }
 
-check_mutation "omit-data-sync-barrier" "$TMPDIR/m1/m1.fizz" "ValidMetaRootsMatchDurablePages" "$TMPDIR/m1/out"
-check_mutation "ignore-mvcc-reader-watermark" "$TMPDIR/m2/m2.fizz" "NoLivePageInFreelist" "$TMPDIR/m2/out"
-check_mutation "omit-alt-meta-invalidation-on-sync-fail" "$TMPDIR/m3/m3.fizz" "NoResurrectedAbortedMeta" "$TMPDIR/m3/out"
-check_mutation "omit-dirty-alt-meta-fence" "$TMPDIR/m4/m4.fizz" "NoResurrectedAbortedMeta" "$TMPDIR/m4/out"
-check_mutation "omit-release-on-close-reader" "$TMPDIR/m5/m5.fizz" "EventuallyReclaimsEligibleFreelist" "$TMPDIR/m5/out"
-echo "==> All 5 formal spec mutation checks (4 safety + 1 liveness) passed!"
+check_mutation "omit-data-sync-barrier" "$TMPDIR/m1.qnt" "inv_valid_meta_roots_match_durable"
+check_mutation "ignore-mvcc-reader-watermark" "$TMPDIR/m2.qnt" "inv_no_live_page_in_freelist"
+check_mutation "omit-alt-meta-invalidation-on-sync-fail" "$TMPDIR/m3.qnt" "inv_no_resurrected_aborted_meta"
+check_mutation "omit-dirty-alt-meta-fence" "$TMPDIR/m4.qnt" "inv_no_resurrected_aborted_meta"
+check_mutation "omit-release-on-close-reader" "$TMPDIR/m5.qnt" "inv_release_bound_safe"
+echo "==> All 5 Quint formal spec mutation checks passed!"

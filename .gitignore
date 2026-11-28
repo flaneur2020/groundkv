@@ -3,19 +3,9 @@ bin/
 coverage/
 *.db
 
-# FizzBee generated model-checker artifacts
-formal/fizzbee/**/out/
-formal/fizzbee/**/*.json
-
-# TLA+ TLC generated state/trace artifacts
-states/
-formal/tla/states/
-formal/tla/*_TTrace_*
-*_TTrace_*.tla
-*_TTrace_*.bin
+# Quint & trace outputs
+*.itf.json
 *.ndjson
-*.old
-*.jar
 
 # Lean 4 build artifacts
 formal/lean/.lake/

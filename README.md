@@ -1,6 +1,6 @@
 # GroundKV
 
-A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (COW) B+Tree** with **MVCC reader-aware freelist reclamation**, designed with a **7-layer formal verification pyramid** (Dafny verified Go codegen, Lean 4 unbounded proofs, FizzBee model checking & MBT, TLA+ trace validation, Deterministic Simulation Testing, real `SIGKILL` crash & linearizability checks, and native Go fuzzing).
+A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (COW) B+Tree** with **MVCC reader-aware freelist reclamation**, **zero third-party Go dependencies**, and a **6-layer formal verification pyramid** (Dafny verified Go codegen, Lean 4 unbounded proofs, Quint formal specs / mutations / trace validation / ITF MBT, Deterministic Simulation Testing, real `SIGKILL` crash & linearizability checks, and native Go fuzzing).
 
 ## Features
 
@@ -15,9 +15,8 @@ A BoltDB-inspired embedded key-value engine in Go built on a **copy-on-write (CO
 - **Dual Meta Pages & Crash Recovery**: alternating meta pages (Page 0 and Page 1) with 4-phase `Sync`-ordered commits, `dirtyAltMeta` double-fault fencing, and automatic fallback on torn meta writes.
 - **MVCC Snapshot Isolation & Freelist Reclamation**: concurrent lock-free readers pinned to immutable B+Tree roots alongside a single serialized writer; freed pages are persisted as COW freelist chains and recycled strictly when `freeTxID <= min(txid-1, minActiveReaderTxID)`.
 - **Pluggable Storage (`engine.Storage`)**: real OS file storage (`OSFileStorage` with exclusive `flock` locking and parent-directory `fsync` on DB creation) plus per-write fault-injecting `MemStorage`.
-- **Unified Formal Specifications & Proofs (`formal/`)**:
-  - **`formal/fizzbee/`** — 3 FizzBee specs (`contract/kv_contract.fizz`, `storage_protocol/storage_protocol.fizz`, `btree_ops/btree_ops.fizz`) verified exhaustively for safety & temporal liveness (`always eventually` + `fair`), backed by **5 formal spec mutation proofs** (`make check-mutations`) and Go MBT harnesses under `verify/mbt/`.
-  - **`formal/tla/`** — Unbounded TLA+ protocol spec (`GroundKVProtocol.tla`) & TLC **Formal Trace Validation** (`GroundKVTrace.tla`, `make trace-validate`) replaying real NDJSON traces emitted by `engine.JSONLineTracer` during DST swarm runs.
+- **Three Strictly Orthogonal Formal Layers (`formal/`)**:
+  - **`formal/quint/`** — 3 strongly-typed Quint specs (`storage_protocol.qnt`, `btree_ops.qnt`, `trace_protocol.qnt`) covering invariant simulation, **5 formal spec mutation proofs** (`make check-mutations`), **Quint Trace Validation** replaying ~4,500 real Go DST NDJSON transitions (`make trace-validate`), and **zero-dependency Go ITF Model-Based Testing** (`verify/mbt/`, `make mbt`) driving BOTH `GoCore` and `verified.NewCore` under `-race`.
   - **`formal/lean/`** — 13 unbounded machine-checked Lean 4 theorems (`DualMeta.lean`, `FreelistMVCC.lean`, `FreelistSizing.lean`, `BTreeSplit.lean`; pure Lean 4 stdlib, zero `sorry`, zero custom axioms, verified via `#print axioms` in `make prove`).
   - **`formal/dafny/`** — 6 Dafny modules (1,027 verified assertions, zero `assume`) compiled to Go under `engine/verified/internal/dafnygen/`.
 
@@ -47,27 +46,26 @@ groundkv/
 │   ├── storage.go / memstorage.go   # Storage interface, OSFileStorage (+ flock) & fault-injecting MemStorage
 │   ├── trace.go                     # Zero-overhead-when-nil structured NDJSON protocol tracer
 │   └── db_test.go / fuzz_test.go    # Unit, concurrency (-race), crash, freelist & native fuzz tests
-├── formal/                          # Unified formal methods (all 4 formal layers under one root)
-│   ├── fizzbee/                     # FizzBee specs (contract, storage_protocol, btree_ops)
-│   ├── tla/                         # Unbounded TLA+ protocol spec & TLC Trace Validation
+├── formal/                          # 3 strictly orthogonal formal verification layers
+│   ├── quint/                       # Quint specs (storage_protocol, btree_ops, trace_protocol) -> MBT & trace validation
 │   ├── lean/                        # Unbounded Lean 4 proofs (13 theorems, 0 sorry)
 │   └── dafny/                       # Dafny Phase 1 & Phase 2 proofs -> Go codegen (1,027 verified, 0 assume)
-├── verify/                          # Executable verification harnesses
+├── verify/                          # Executable verification harnesses (zero external Go deps)
 │   ├── dst/                         # Deterministic Simulation Testing, SIGKILL crash & linearizability
 │   │   ├── profiles.go              # 7 Swarm Testing profiles
 │   │   ├── sim.go                   # Seed-reproducible simulation loop & fault-injecting step dispatch
 │   │   ├── oracle.go                # Shadow oracle, MVCC/freelist disjointness & bit-rot invariant verifier
 │   │   ├── simdisk.go / coverage.go # 64B sector-level SimDisk & 19 "sometimes" coverage assertions
 │   │   └── *_test.go                # Swarm, replay, trace export, SIGKILL & linearizability tests
-│   └── mbt/                         # FizzBee MBT harnesses & zero-shadow-state Go adapters
-│       ├── contract/                # kv_contract (parallel + -race on OSFileStorage)
-│       ├── storage_protocol/        # storage_protocol (Disk + Engine white-box protocol)
-│       └── btree_ops/               # btree_ops (splits, deletes, root collapse & range scans)
+│   └── mbt/                         # Pure-Go stdlib Quint ITF MBT driver (GoCore + verified.NewCore)
+│       ├── itf.go                   # Minimal ITF JSON parser & Quint trace generator
+│       ├── storage_protocol_test.go # White-box dual-meta, MVCC, FailSync & 3-mode crash MBT
+│       └── btree_ops_test.go        # 3-level B+Tree splits, deletes, collapses & [start, end) scan MBT
 ├── cmd/
 │   ├── groundkv/                    # CLI (-engine go|verified: put, get, del, scan, meta, verify)
 │   └── groundkv-dst/                # Standalone DST swarm runner (-seed, -seeds, -steps)
-├── scripts/                         # Verification, mutation, Dafny codegen, Lean, TLA+ & MBT automation
-├── docs/architecture.md             # Deep dive on disk format, Core strategy & 7-layer verification pyramid
+├── scripts/                         # Verification, mutation, Dafny codegen, Lean & Quint trace automation
+├── docs/architecture.md             # Deep dive on disk format, Core strategy & verification pyramid
 └── Makefile                         # Run `make help` to list all verification & build targets
 ```
 
@@ -81,28 +79,19 @@ make help
 
 ### 2. Run the full verification suite (`make verify`)
 
-Runs Dafny verification & codegen reproducibility audit, Lean 4 proofs, FizzBee model checking, spec & Go code mutation checks, TLA+ trace validation, `-race` tests (both `engine/` and `engine/verified/`), DST swarm, and MBT adapter smoke tests:
+Runs Dafny verification & codegen reproducibility audit, Lean 4 proofs, Quint specs, spec & Go code mutation checks, Quint trace validation on real DST traces, `-race` tests (both `engine/` and `engine/verified/`), DST swarm, and Quint ITF MBT:
 
 ```bash
 make verify
 ```
 
-### 3. Run full FizzBee Model-Based Testing (`make mbt`)
-
-Download `fizzbee-mbt-*-linux_x86.tar.gz` from [fizzbee-io/fizzbee-mbt-releases](https://github.com/fizzbee-io/fizzbee-mbt-releases/releases), place `fizzbee-mbt-server` and `fizzbee-mbt-runner` on your `PATH`, and run:
+### 3. Run Go native fuzzing
 
 ```bash
-make mbt
+make fuzz
 ```
 
-### 4. Regenerate MBT interfaces after editing a `.fizz` spec
-
-```bash
-make check-specs
-make scaffold-interfaces
-```
-
-### 5. Try the CLI (Pure Go or Dafny-Verified Kernel)
+### 4. Build & use the CLI (`-engine go` or `-engine verified`)
 
 ```bash
 make build

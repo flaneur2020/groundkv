@@ -46,7 +46,7 @@ func (db *DB) FreelistState() FreelistSnapshot {
 }
 
 // ReachablePages returns all page IDs reachable from the given B+Tree root and
-// optional freelist chain head. Used by tests and FizzBee MBT to assert that no
+// optional freelist chain head. Used by tests and Quint MBT to assert that no
 // reachable page is ever present in the reusable free pool.
 func (db *DB) ReachablePages(root PageID, freelistHead PageID) ([]PageID, error) {
 	db.mu.RLock()
@@ -117,7 +117,7 @@ type MetaSlot struct {
 }
 
 // InspectMeta reads both on-disk meta pages (Page 0 and Page 1) without failing
-// if one slot is torn/corrupted. Used by crash-recovery tests and FizzBee MBT.
+// if one slot is torn/corrupted. Used by crash-recovery tests and Quint MBT.
 func (db *DB) InspectMeta() (slot0 MetaSlot, slot1 MetaSlot, err error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -134,7 +134,7 @@ func (db *DB) InspectMeta() (slot0 MetaSlot, slot1 MetaSlot, err error) {
 }
 
 // DualMeta reads both on-disk meta pages (Page 0 and Page 1) for verification
-// and FizzBee MBT state inspection.
+// and Quint MBT state inspection.
 func (db *DB) DualMeta() (meta0 Meta, meta1 Meta, err error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -153,7 +153,7 @@ func (db *DB) DualMeta() (meta0 Meta, meta1 Meta, err error) {
 }
 
 // ReadTreeAtRoot returns all key-value pairs reachable from a specific committed
-// root page ID. Used by diagnostics and FizzBee MBT state verification.
+// root page ID. Used by diagnostics and Quint MBT state verification.
 func (db *DB) ReadTreeAtRoot(root PageID) (map[string]string, error) {
 	db.mu.RLock()
 	if db.closed {
@@ -170,7 +170,7 @@ func (db *DB) ReadTreeAtRoot(root PageID) (map[string]string, error) {
 }
 
 // RawPage reads the raw bytes of a committed page from storage.
-// Used by COW immutability tests and FizzBee MBT adapters.
+// Used by COW immutability tests and Quint MBT drivers.
 func (db *DB) RawPage(pgid PageID) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()

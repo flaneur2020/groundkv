@@ -35,7 +35,7 @@ type Options struct {
 	// MaxLeafKeys optionally caps the number of key/value entries per leaf page
 	// before splitting. Zero means split only when the page byte capacity is
 	// exceeded. Setting this to a small number (e.g. 2) in tests forces deep
-	// B+Tree splits even with tiny FizzBee MBT key domains.
+	// B+Tree splits even with tiny Quint MBT key domains.
 	MaxLeafKeys int
 
 	// MaxBranchKeys optionally caps the number of child pointers per branch page

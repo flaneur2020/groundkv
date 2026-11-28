@@ -37,7 +37,7 @@ type pendingWrite struct {
 // MemStorage is an in-memory Storage implementation that tracks every unsynced
 // WriteAt separately from synced (durable) bytes. It supports deterministic
 // crash modes (drop unsynced, reordered meta flush, torn meta write) for
-// durability-grade unit tests and FizzBee MBT.
+// durability-grade unit tests and Quint MBT.
 type MemStorage struct {
 	mu        sync.RWMutex
 	working   []byte
